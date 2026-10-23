@@ -6,7 +6,7 @@ overlay.
 
 - **FPS** from gamescope's stats pipe, with a one-minute graph, average/low and the focused app
 - **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, battery % and time left/to full
-- **Bars:** per-cluster CPU load and clock with the current cap, GPU clock and cap, RAM
+- **Bars:** per-cluster CPU load and clock with the current cap, RAM
 - **Knobs:** performance profile and GPU clock (auto or pinned at max), via Armada's `org.armada.Power` D-Bus service — no root needed.
   Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):
   Eco → conservative, Balanced → schedutil, Performance → performance

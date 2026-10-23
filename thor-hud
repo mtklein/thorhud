@@ -280,7 +280,6 @@ class Sampler:
         s["gpu"] = self.gpu.sample()
         if GPU_DEVFREQ:
             s["gpu_mhz"] = read_int(f"{GPU_DEVFREQ}/cur_freq") // 1_000_000
-            s["gpu_max_mhz"] = read_int(f"{GPU_DEVFREQ}/max_freq") // 1_000_000
         bat = uevent(BATTERY)
         usb = uevent(USB)
         s["bat_pct"] = int(bat.get("CAPACITY", 0))
@@ -572,8 +571,6 @@ class Hud(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Thor HUD")
         self.sampler = Sampler()
         self.power = Power(lambda: GLib.idle_add(self.sync_knobs))
-        self.gpu_freqs = sorted(int(f) // 1_000_000 for f in
-                                read(f"{GPU_DEVFREQ}/available_frequencies").split()) if GPU_DEVFREQ else []
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
                        margin_top=8, margin_bottom=8, margin_start=8, margin_end=8,
@@ -596,7 +593,7 @@ class Hud(Gtk.ApplicationWindow):
         root.append(gauges)
 
         self.bars = Bars()
-        self.bars.set_size_request(-1, 118)
+        self.bars.set_size_request(-1, 96)
         root.append(self.card(self.bars))
 
         knobs = Gtk.Grid(column_spacing=10, row_spacing=6, css_classes=["card", "knobs"])
@@ -697,10 +694,6 @@ class Hud(Gtk.ApplicationWindow):
         for name, usage, cur, cap, hw in s["clusters"]:
             rows.append((name, usage / 100, cap / hw if hw else None,
                          f"{usage:3.0f}% {cur / 1000:.2f}G", CPU_C))
-        if "gpu_mhz" in s and self.gpu_freqs:
-            top = self.gpu_freqs[-1]
-            rows.append(("GPU", s["gpu_mhz"] / top, s["gpu_max_mhz"] / top,
-                         f"{s['gpu_mhz']} MHz", GPU_C))
         rows.append(("RAM", s["mem_used"] / s["mem_total"], None,
                      f"{s['mem_used']:.1f}/{s['mem_total']:.0f}G", NEUTRAL))
         self.bars.update(rows)
