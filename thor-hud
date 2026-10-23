@@ -69,6 +69,15 @@ POWER_SCALE = heat_scale(5, 6.8, 8.3, 10)  # watts drawn from the battery
 RAM_SCALE = heat_scale(80, 85.5, 90, 95)   # % of memory in use
 
 
+_text_slots = {}
+
+
+def begin_text(widget):
+    """Call at the top of each draw func: resets that widget's text call order."""
+    for key in [k for k in _text_slots if k[0] == id(widget)]:
+        del _text_slots[key]
+
+
 def heat_color(t, scale):
     if t <= scale[0][0]:
         return scale[0][1]
@@ -184,16 +193,32 @@ class FpsReader(threading.Thread):
 
 
 class GpuBusy:
-    """GPU utilisation from DRM fdinfo (drm-engine-gpu busy ns per client)."""
+    """GPU utilisation from DRM fdinfo (drm-engine-gpu busy ns per client).
+
+    Many fds share one DRM client, so after each (10 s) rescan we keep a single
+    fdinfo path per client and read only those each second.
+    """
+
+    RESCAN = 10
 
     def __init__(self):
-        self.fdinfos = []
+        self.clients = {}  # drm-client-id -> fdinfo path
         self.last_scan = 0.0
         self.prev = {}
         self.prev_t = None
 
+    @staticmethod
+    def parse(path):
+        client = ns = None
+        for line in read(path).splitlines():
+            if line.startswith("drm-client-id:"):
+                client = line.split()[1]
+            elif line.startswith("drm-engine-gpu:"):
+                ns = int(line.split()[1])
+        return client, ns
+
     def scan(self):
-        found = []
+        clients = {}
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
                 continue
@@ -204,26 +229,25 @@ class GpuBusy:
                 continue
             for fd in fds:
                 try:
-                    if os.readlink(f"{fd_dir}/{fd}").startswith("/dev/dri/"):
-                        found.append(f"/proc/{pid}/fdinfo/{fd}")
+                    if not os.readlink(f"{fd_dir}/{fd}").startswith("/dev/dri/"):
+                        continue
                 except OSError:
-                    pass
-        self.fdinfos = found
+                    continue
+                path = f"/proc/{pid}/fdinfo/{fd}"
+                client, ns = self.parse(path)
+                if client is not None and ns is not None:
+                    clients.setdefault(client, path)
+        self.clients = clients
         self.last_scan = time.monotonic()
 
     def sample(self):
         now = time.monotonic()
-        if now - self.last_scan > 3:
+        if now - self.last_scan > self.RESCAN:
             self.scan()
         busy = {}
-        for path in self.fdinfos:
-            client = ns = None
-            for line in read(path).splitlines():
-                if line.startswith("drm-client-id:"):
-                    client = line.split()[1]
-                elif line.startswith("drm-engine-gpu:"):
-                    ns = int(line.split()[1])
-            if client is not None and ns is not None:
+        for client, path in self.clients.items():
+            _, ns = self.parse(path)
+            if ns is not None:
                 busy[client] = ns
         pct = None
         if self.prev_t is not None:
@@ -307,21 +331,36 @@ def rgb(cr, c, a=1.0):
     cr.set_source_rgba(c[0], c[1], c[2], a)
 
 
+_layouts = {}  # (widget, size, weight, max_width, slot) -> [layout, text, extents]
+
+
 def text(cr, widget, s, x, y, size, color, weight=Pango.Weight.BOLD, align="center", anchor="middle",
          max_width=None):
-    layout = PangoCairo.create_layout(cr)
-    desc = Pango.FontDescription.from_string("Noto Sans")
-    desc.set_weight(weight)
-    desc.set_absolute_size(size * Pango.SCALE)
-    layout.set_font_description(desc)
-    attrs = Pango.AttrList()
-    attrs.insert(Pango.attr_font_features_new("tnum"))
-    layout.set_attributes(attrs)
-    layout.set_text(s, -1)
-    if max_width:
-        layout.set_width(int(max_width * Pango.SCALE))
-        layout.set_ellipsize(Pango.EllipsizeMode.END)
-    _, ext = layout.get_pixel_extents()
+    # Layouts are cached per call site (keyed by widget, style and the order of
+    # calls within this draw) so font setup and shaping only redo on change.
+    style = (id(widget), round(size, 2), int(weight), int(max_width) if max_width else 0)
+    slot = _text_slots.get(style, 0)
+    _text_slots[style] = slot + 1
+    entry = _layouts.get(style + (slot,))
+    if entry is None:
+        layout = PangoCairo.create_layout(cr)
+        desc = Pango.FontDescription.from_string("Noto Sans")
+        desc.set_weight(weight)
+        desc.set_absolute_size(size * Pango.SCALE)
+        layout.set_font_description(desc)
+        attrs = Pango.AttrList()
+        attrs.insert(Pango.attr_font_features_new("tnum"))
+        layout.set_attributes(attrs)
+        if max_width:
+            layout.set_width(int(max_width * Pango.SCALE))
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+        entry = _layouts[style + (slot,)] = [layout, None, None]
+    layout = entry[0]
+    PangoCairo.update_layout(cr, layout)
+    if entry[1] != s:
+        layout.set_text(s, -1)
+        entry[1], entry[2] = s, layout.get_pixel_extents()[1]
+    ext = entry[2]
     w, h = ext.width, ext.height
     dx = {"center": -w / 2 - ext.x, "left": -ext.x, "right": -w - ext.x}[align]
     dy = {"middle": -h / 2 - ext.y, "top": -ext.y, "bottom": -h - ext.y}[anchor]
@@ -348,6 +387,7 @@ class Gauge(Gtk.DrawingArea):
         self.queue_draw()
 
     def draw(self, _area, cr, w, h):
+        begin_text(self)
         r = min(w, h * 1.02) / 2 - 6
         cx, cy = w / 2, h / 2 + r * 0.08
         lw = max(4.0, r * 0.13)
@@ -386,6 +426,7 @@ class FpsPanel(Gtk.DrawingArea):
         self.queue_draw()
 
     def draw(self, _area, cr, w, h):
+        begin_text(self)
         pad = 10
         top = self.max_hz  # fixed scale: 0 to the display's top refresh rate
         gx, gw = pad, w - 2 * pad
