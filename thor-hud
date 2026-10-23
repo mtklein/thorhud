@@ -42,8 +42,16 @@ TEXT = hexc("#e5e8eb")
 CPU_C = hexc("#8bafcf")     # blue
 GPU_C = hexc("#ada4cd")     # violet
 NEUTRAL = hexc("#9facba")   # slate (fps, ram, battery)
-WARN = hexc("#dea45f")
-BAD = hexc("#dd766f")
+# Battery ring bands: (at or above %, colour). Plain good/bad signals, so these
+# carry more colour than the category accents.
+BATTERY_BANDS = [(40, hexc("#86b990")),   # green
+                 (15, hexc("#d9c36a")),   # yellow
+                 (5, hexc("#dd766f")),    # red
+                 (0, hexc("#c77dff"))]    # bright purple
+
+
+def battery_color(pct):
+    return next(c for floor, c in BATTERY_BANDS if pct >= floor)
 # Heat scale (cool blue → khaki → amber → red), all near the same lightness
 # until hot. Used for temperature, battery draw and RAM; the number is tinted too
 # once a reading reaches amber.
@@ -367,7 +375,7 @@ class FpsPanel(Gtk.DrawingArea):
         super().__init__(hexpand=True, vexpand=True)
         self.history = collections.deque(maxlen=120)
         self.fps, self.focus = None, ""
-        self.battery, self.battery_sub, self.battery_color = "", "", TEXT
+        self.battery, self.battery_sub = None, ""
         self.max_hz = display_max_hz()
         self.set_draw_func(self.draw)
 
@@ -419,10 +427,23 @@ class FpsPanel(Gtk.DrawingArea):
         if self.focus:
             text(cr, self, app_name(self.focus), w / 2, mid, big * 0.36, TEXT,
                  Pango.Weight.NORMAL, "center", "middle", max_width=w * 0.45)
-        if self.battery:
-            bw = text(cr, self, self.battery, pad, mid, big * 0.5, self.battery_color,
-                      align="left", anchor="middle")
-            text(cr, self, self.battery_sub, pad + bw + 8, mid, big * 0.3, DIM,
+        if self.battery is not None:
+            # Small ring meter around the percentage.
+            r = big * 0.58
+            cx, lw = pad + r, 3.5
+            cr.set_line_width(lw)
+            cr.set_line_cap(1)
+            rgb(cr, TRACK)
+            cr.new_path()  # text drawing leaves a current point that arc() would join
+            cr.arc(cx, mid, r - lw / 2, 0, 2 * math.pi)
+            cr.stroke()
+            if self.battery > 0:
+                rgb(cr, battery_color(self.battery))
+                start = -math.pi / 2
+                cr.arc(cx, mid, r - lw / 2, start, start + 2 * math.pi * min(self.battery, 100) / 100)
+                cr.stroke()
+            text(cr, self, f"{self.battery}%", cx, mid, big * 0.3, TEXT)
+            text(cr, self, self.battery_sub, pad + 2 * r + 8, mid, big * 0.3, DIM,
                  Pango.Weight.NORMAL, "left", "middle")
 
 
@@ -623,9 +644,7 @@ class Hud(Gtk.ApplicationWindow):
             eta = f"{int(hours)}h{int(hours * 60) % 60:02d}" + (" to full" if charging else " left")
         elif charging:
             eta = "charging"
-        low = None if charging else BAD if s["bat_pct"] <= 10 else WARN if s["bat_pct"] <= 20 else None
-        self.fps.battery, self.fps.battery_sub = f"{s['bat_pct']}%", eta
-        self.fps.battery_color = low or TEXT
+        self.fps.battery, self.fps.battery_sub = s["bat_pct"], eta
         ram = 100 * s["mem_used"] / s["mem_total"]
         rc = heat_color(ram, RAM_SCALE)
         self.g_ram.update(ram, f"{ram:.0f}%", f"{s['mem_used']:.1f} of {s['mem_total']:.0f}G", rc,

@@ -12,7 +12,7 @@ overlay.
   Eco → conservative, Balanced → schedutil, Performance → performance
 
 Colours are muted and equal in lightness; only temperature, battery draw and RAM (blue → amber → red)
-and low battery change colour with their value.
+change colour with their value; the battery ring runs green (≥40%), yellow (≥15%), red (≥5%), then bright purple.
 
 ## Install
 
