@@ -4,9 +4,9 @@ A quiet performance dashboard for the bottom screen of the AYN Thor running
 [Armada OS](https://armadaos.dev/) — the Linux stand-in for the stock Android
 overlay.
 
-- **FPS** from gamescope's stats pipe, with a one-minute graph, average/low and the focused app
-- **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, battery % and time left/to full
-- **Bars:** per-cluster CPU load and clock, RAM
+- **Header:** FPS (from gamescope's stats pipe), the focused game's title, battery % and time left/to full
+- **Graph:** about a minute of FPS history, scaled up to the display's top refresh rate
+- **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, RAM
 - **Knobs:** performance profile and GPU clock (auto or pinned at max), via Armada's `org.armada.Power` D-Bus service — no root needed.
   Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):
   Eco → conservative, Balanced → schedutil, Performance → performance
