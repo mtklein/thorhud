@@ -26,6 +26,7 @@ BATTERY = "/sys/class/power_supply/battery"
 USB = "/sys/class/power_supply/qcom-battmgr-usb"
 CLUSTERS = [("LITTLE", "policy0"), ("BIG", "policy3"), ("PRIME", "policy7")]
 GOVERNORS = ["conservative", "schedutil", "performance"]
+MAX_FPS = 240
 
 # Muted palette. Category accents share OKLCH lightness 0.74 / chroma 0.06 so no
 # metric outshines another; green and red are reserved for good/bad signals and
@@ -109,8 +110,12 @@ class FpsReader(threading.Thread):
                     for line in f:
                         key, _, val = line.strip().partition("=")
                         if key == "fps":
-                            self.fps = float(val)
-                            self.stamp = time.monotonic()
+                            fps = float(val)
+                            # gamescope occasionally reports absurd rates (near-zero
+                            # frame intervals); no panel here goes past 240 Hz.
+                            if 0 <= fps <= MAX_FPS:
+                                self.fps = fps
+                                self.stamp = time.monotonic()
                         elif key == "focus":
                             self.focus = val
             except (OSError, ValueError):
@@ -331,7 +336,7 @@ class FpsPanel(Gtk.DrawingArea):
 
     def draw(self, _area, cr, w, h):
         pad = 10
-        top = max(1.0, max(self.history, default=60) * 1.15, 30)
+        top = min(MAX_FPS, max(30, max(self.history, default=60) * 1.15))
         top = 30 * math.ceil(top / 30)
         gx, gw = pad, w - 2 * pad
         gy, gh = h * 0.50, h * 0.50 - pad
