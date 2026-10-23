@@ -1,0 +1,15 @@
+[Unit]
+Description=Thor HUD performance dashboard on the bottom screen
+After=armada-bottom-screen.service
+BindsTo=armada-bottom-screen.service
+
+[Service]
+Environment=WAYLAND_DISPLAY=armada-plasma-bottom GDK_BACKEND=wayland
+UnsetEnvironment=DISPLAY
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S "$XDG_RUNTIME_DIR/armada-plasma-bottom" ] && exit 0; sleep 1; done; exit 1'
+ExecStart=%h/.local/bin/thor-hud
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=armada-bottom-screen.service

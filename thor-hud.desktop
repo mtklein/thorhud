@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Thor HUD
+Comment=Performance meters and quick settings
+Exec=systemctl --user restart thor-hud.service
+Icon=utilities-system-monitor
+Categories=System;Monitor;
