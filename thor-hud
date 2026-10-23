@@ -339,7 +339,7 @@ class Gauge(Gtk.DrawingArea):
         self.queue_draw()
 
     def draw(self, _area, cr, w, h):
-        r = min(w, h * 1.12) / 2 - 6
+        r = min(w, h * 1.02) / 2 - 6
         cx, cy = w / 2, h / 2 + r * 0.08
         lw = max(4.0, r * 0.13)
         start, sweep = math.radians(135), math.radians(270)
@@ -429,14 +429,18 @@ class FpsPanel(Gtk.DrawingArea):
 
 # ---------------------------------------------------------------- app
 
+# True black everywhere for the OLED panel: no section frames or fills, and
+# only the selected knob lights up.
 CSS = b"""
 window, .root { background: #000; color: #e5e8eb; font-family: "Noto Sans"; }
-.card { background: #0e1012; border-radius: 14px; padding: 6px; }
-.seg button { background: #1a1d21; color: #82878c; border: none; box-shadow: none;
-              min-height: 34px; padding: 0 6px; font-weight: bold; font-size: 13px; border-radius: 0; }
-.seg button:first-child { border-radius: 10px 0 0 10px; }
+.card { background: #000; padding: 6px; }
+.seg button { background: #000; color: #82878c; border: 1px solid #262a2f; border-left-width: 0;
+              box-shadow: none; min-height: 34px; padding: 0 6px; font-weight: bold; font-size: 13px;
+              border-radius: 0; }
+.seg button:first-child { border-left-width: 1px; border-radius: 10px 0 0 10px; }
 .seg button:last-child { border-radius: 0 10px 10px 0; }
-.seg button:checked { background: #3a434d; color: #e5e8eb; }
+.seg button:checked { background: #262b31; color: #e5e8eb; }
+.knobs { padding: 0 7px 7px 7px; }
 """
 
 
@@ -529,7 +533,7 @@ class Hud(Gtk.ApplicationWindow):
             gauges.append(self.card(g))
         root.append(gauges)
 
-        knobs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
+        knobs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["knobs"])
         root.append(knobs)
 
         profiles = self.power.get("AvailableProfiles", ["Eco", "Balanced", "Performance"])
