@@ -5,7 +5,7 @@ A quiet performance dashboard for the bottom screen of the AYN Thor running
 overlay.
 
 - **Header:** FPS (from gamescope's stats pipe), the focused game's title, battery % and time left/to full
-- **Graph:** about a minute of FPS history, scaled up to the display's top refresh rate
+- **Graph:** about a minute of FPS history on a fixed 0–120 scale (the display's top refresh rate), with reference lines at 30, 60 and 120
 - **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, RAM
 - **Knobs:** performance profile and GPU clock (auto or pinned at max), via Armada's `org.armada.Power` D-Bus service — no root needed.
   Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):

@@ -28,6 +28,7 @@ USB = "/sys/class/power_supply/qcom-battmgr-usb"
 # profile changes (from here or from Steam), since armada-powerd applies its own.
 PROFILE_GOVERNOR = {"Eco": "conservative", "Balanced": "schedutil", "Performance": "performance"}
 MAX_FPS = 240
+REFERENCE_FPS = (30, 60, 120)  # graph reference lines (plus the display's top rate)
 
 # Muted palette. Category accents share OKLCH lightness 0.74 / chroma 0.06 so no
 # metric outshines another; green and red are reserved for good/bad signals and
@@ -386,24 +387,21 @@ class FpsPanel(Gtk.DrawingArea):
 
     def draw(self, _area, cr, w, h):
         pad = 10
-        top = max(30, max((v for v in self.history if v is not None), default=0) * 1.15)
-        top = min(self.max_hz, 30 * math.ceil(top / 30))
+        top = self.max_hz  # fixed scale: 0 to the display's top refresh rate
         gx, gw = pad, w - 2 * pad
         big = min(h * 0.34, 44)
         gy = pad + big * 1.4 + 6  # graph starts below the readout's line box
         gh = h - gy - pad
-        # Reference lines every 30 fps; label every 60 (or 30 on a short scale),
-        # on the left.
+        # Reference lines at the key frame rates, labelled on the left.
         cr.set_line_width(1)
-        label_step = 30 if top <= 60 else 60
-        for ref in range(30, int(top) + 1, 30):
+        for ref in sorted({r for r in REFERENCE_FPS if r < top} | {top}):
             y = gy + gh - gh * ref / top
             rgb(cr, TRACK, 0.7)
+            cr.new_path()
             cr.move_to(gx, y)
             cr.line_to(gx + gw, y)
             cr.stroke()
-            if ref % label_step == 0:
-                text(cr, self, str(ref), gx, y - 2, 10, DIM, Pango.Weight.NORMAL, "left", "bottom")
+            text(cr, self, str(ref), gx, y - 2, 10, DIM, Pango.Weight.NORMAL, "left", "bottom")
         pts = list(self.history)
         step = gw / (self.history.maxlen - 1)
         x0 = gx + gw - step * (len(pts) - 1)
