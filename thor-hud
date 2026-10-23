@@ -92,6 +92,33 @@ def display_max_hz(default=120):
     return default
 
 
+STEAM = os.path.expanduser("~/.local/share/Steam")
+_app_names = {}
+
+
+def app_name(focus):
+    """gamescope reports the focused app as "steam" or a Steam AppId; show its title."""
+    if focus == "steam":
+        return "Steam"
+    if not focus.isdigit():
+        return focus
+    if focus not in _app_names:
+        name = ""
+        libraries = [STEAM] + [line.split('"')[3] for line in
+                               read(f"{STEAM}/steamapps/libraryfolders.vdf").splitlines()
+                               if line.strip().startswith('"path"')]
+        for lib in libraries:
+            for line in read(f"{lib}/steamapps/appmanifest_{focus}.acf").splitlines():
+                parts = line.split('"')
+                if len(parts) >= 4 and parts[1] == "name":
+                    name = parts[3]
+                    break
+            if name:
+                break
+        _app_names[focus] = name  # Non-Steam shortcuts have no manifest; show nothing.
+    return _app_names[focus]
+
+
 def uevent(path):
     out = {}
     for line in read(f"{path}/uevent").splitlines():
@@ -114,7 +141,11 @@ def cpulist(text):
 # ---------------------------------------------------------------- sampling
 
 class FpsReader(threading.Thread):
-    """Reads gamescope's stats FIFO ("fps=…" / "focus=…" lines)."""
+    """Reads gamescope's stats FIFO ("fps=…" / "focus=…" lines).
+
+    gamescope writes a reading roughly every 300 frames (~10 s at 30 fps, ~2.5 s
+    at 120), and nothing while the screen is static.
+    """
 
     def __init__(self):
         super().__init__(daemon=True)
@@ -281,7 +312,8 @@ def rgb(cr, c, a=1.0):
     cr.set_source_rgba(c[0], c[1], c[2], a)
 
 
-def text(cr, widget, s, x, y, size, color, weight=Pango.Weight.BOLD, align="center", anchor="middle"):
+def text(cr, widget, s, x, y, size, color, weight=Pango.Weight.BOLD, align="center", anchor="middle",
+         max_width=None):
     layout = PangoCairo.create_layout(cr)
     desc = Pango.FontDescription.from_string("Noto Sans")
     desc.set_weight(weight)
@@ -291,6 +323,9 @@ def text(cr, widget, s, x, y, size, color, weight=Pango.Weight.BOLD, align="cent
     attrs.insert(Pango.attr_font_features_new("tnum"))
     layout.set_attributes(attrs)
     layout.set_text(s, -1)
+    if max_width:
+        layout.set_width(int(max_width * Pango.SCALE))
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
     _, ext = layout.get_pixel_extents()
     w, h = ext.width, ext.height
     dx = {"center": -w / 2 - ext.x, "left": -ext.x, "right": -w - ext.x}[align]
@@ -398,8 +433,8 @@ class FpsPanel(Gtk.DrawingArea):
                 text(cr, self, f"avg {avg:.0f}  ·  low {lo:.0f}", w - pad, pad + big * 0.25,
                      big * 0.34, DIM, Pango.Weight.NORMAL, "right", "middle")
         if self.focus:
-            text(cr, self, self.focus, w - pad, pad + big * 0.8, big * 0.3, DIM,
-                 Pango.Weight.NORMAL, "right", "middle")
+            text(cr, self, app_name(self.focus), w - pad, pad + big * 0.8, big * 0.3, DIM,
+                 Pango.Weight.NORMAL, "right", "middle", max_width=w * 0.55)
 
 
 class Bars(Gtk.DrawingArea):
@@ -459,7 +494,8 @@ window, .root { background: #000; color: #e5e8eb; font-family: "Noto Sans"; }
 .seg button:checked { background: #3a434d; color: #e5e8eb; }
 scale trough { background: #23272a; min-height: 6px; border-radius: 3px; }
 scale highlight { background: #6b7580; border-radius: 3px; }
-scale slider { background: #c4c9ce; min-width: 24px; min-height: 24px; border-radius: 12px; }
+scale slider { background: #c4c9ce; min-width: 24px; min-height: 24px; border-radius: 12px;
+               border: none; outline: none; box-shadow: none; }
 scale:disabled slider { background: #4a5058; }
 scale:disabled highlight { background: transparent; }
 .value { font-weight: bold; font-size: 13px; color: #e5e8eb; }
@@ -638,7 +674,8 @@ class Hud(Gtk.ApplicationWindow):
     # -- metrics
     def fast_tick(self):
         r = self.sampler.fps
-        fresh = r.fps is not None and time.monotonic() - r.stamp < 2
+        # Hold a reading until about 1.5 reporting intervals have passed.
+        fresh = r.fps is not None and time.monotonic() - r.stamp < max(3, 450 / max(r.fps, 1))
         self.fps.push(r.fps if fresh else None, r.focus)
         return True
 
