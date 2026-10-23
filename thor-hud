@@ -25,7 +25,9 @@ GPU_DEVFREQ = next(iter(glob.glob("/sys/class/devfreq/*.gpu")), None)
 BATTERY = "/sys/class/power_supply/battery"
 USB = "/sys/class/power_supply/qcom-battmgr-usb"
 CLUSTERS = [("LITTLE", "policy0"), ("BIG", "policy3"), ("PRIME", "policy7")]
-GOVERNORS = ["conservative", "schedutil", "performance"]
+# Each profile carries its CPU governor; the HUD reasserts it whenever the
+# profile changes (from here or from Steam), since armada-powerd applies its own.
+PROFILE_GOVERNOR = {"Eco": "conservative", "Balanced": "schedutil", "Performance": "performance"}
 MAX_FPS = 240
 
 # Muted palette. Category accents share OKLCH lightness 0.74 / chroma 0.06 so no
@@ -283,7 +285,8 @@ class Sampler:
         usb = uevent(USB)
         s["bat_pct"] = int(bat.get("CAPACITY", 0))
         s["bat_status"] = bat.get("STATUS", "")
-        s["bat_w"] = abs(int(bat.get("POWER_NOW", 0))) / 1e6
+        # POWER_NOW on the Thor's battmgr is stale/garbage (~43 W at a real ~9 W); use V×I.
+        s["bat_w"] = abs(int(bat.get("VOLTAGE_NOW", 0)) * int(bat.get("CURRENT_NOW", 0))) / 1e12
         s["usb_w"] = (int(usb.get("VOLTAGE_NOW", 0)) * int(usb.get("CURRENT_NOW", 0)) / 1e12
                       if usb.get("ONLINE") == "1" else 0.0)
         cur = abs(int(bat.get("CURRENT_NOW", 0)))
@@ -396,7 +399,9 @@ class FpsPanel(Gtk.DrawingArea):
         top = max(30, max(self.history, default=60) * 1.15)
         top = min(self.max_hz, 30 * math.ceil(top / 30))
         gx, gw = pad, w - 2 * pad
-        gy, gh = h * 0.50, h * 0.50 - pad
+        big = min(h * 0.34, 44)
+        gy = pad + big * 1.4 + 6  # graph starts below the readout's line box
+        gh = h - gy - pad
         # Reference lines every 30 fps; label every 60 (or 30 on a short scale),
         # on the left, clear of the app name.
         cr.set_line_width(1)
@@ -425,7 +430,6 @@ class FpsPanel(Gtk.DrawingArea):
             rgb(cr, NEUTRAL)
             cr.set_line_width(1.5)
             cr.stroke()
-        big = h * 0.34
         shown = f"{self.fps:.0f}" if self.fps is not None else "idle"
         tw = text(cr, self, shown, pad, pad, big, TEXT if self.fps is not None else DIM,
                   align="left", anchor="top")
@@ -609,9 +613,6 @@ class Hud(Gtk.ApplicationWindow):
         profiles = self.power.get("AvailableProfiles", ["Eco", "Balanced", "Performance"])
         self.k_profile = Segmented([(p, p) for p in profiles],
                                    lambda v: self.power.set("Profile", GLib.Variant("s", v)), "profile")
-        self.k_gov = Segmented([(g, {"conservative": "Conserv.", "schedutil": "Sched",
-                                     "performance": "Perf"}[g]) for g in GOVERNORS],
-                               lambda v: self.power.set("CpuScalingGovernor", GLib.Variant("s", v)), "gov")
         self.k_gpu_mode = Segmented([("auto", "Auto"), ("manual", "Fixed")], self.pick_gpu_mode, "gpu")
         self.k_gpu_clock = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
                                                     0, max(1, len(self.gpu_freqs) - 1), 1)
@@ -620,18 +621,18 @@ class Hud(Gtk.ApplicationWindow):
         self.k_gpu_clock.connect("value-changed", self.gpu_clock_moved)
         self.k_gpu_label = Gtk.Label(css_classes=["value"], width_chars=8, xalign=1)
         self.gpu_clock_timer = None
+        self.governor_timer = None
         self.syncing = False
 
-        for row, (cap, widget) in enumerate([("PROFILE", self.k_profile), ("CPU GOV", self.k_gov)]):
-            knobs.attach(Gtk.Label(label=cap, xalign=0, css_classes=["caption"]), 0, row, 1, 1)
-            knobs.attach(widget, 1, row, 2, 1)
-        knobs.attach(Gtk.Label(label="GPU CLK", xalign=0, css_classes=["caption"]), 0, 2, 1, 1)
+        knobs.attach(Gtk.Label(label="PROFILE", xalign=0, css_classes=["caption"]), 0, 0, 1, 1)
+        knobs.attach(self.k_profile, 1, 0, 2, 1)
+        knobs.attach(Gtk.Label(label="GPU CLK", xalign=0, css_classes=["caption"]), 0, 1, 1, 1)
         gpu_row = Gtk.Box(spacing=10)
         self.k_gpu_mode.set_size_request(130, -1)
         gpu_row.append(self.k_gpu_mode)
         gpu_row.append(self.k_gpu_clock)
         gpu_row.append(self.k_gpu_label)
-        knobs.attach(gpu_row, 1, 2, 2, 1)
+        knobs.attach(gpu_row, 1, 1, 2, 1)
 
         self.sync_knobs()
         self.tick()
@@ -647,7 +648,7 @@ class Hud(Gtk.ApplicationWindow):
     def sync_knobs(self):
         self.syncing = True
         self.k_profile.select(self.power.get("Profile"))
-        self.k_gov.select(self.power.get("CpuScalingGovernor"))
+        self.enforce_governor()
         level = self.power.get("GpuPerformanceLevel", "auto")
         self.k_gpu_mode.select(level)
         clock = self.power.get("ManualGpuClock", self.gpu_freqs[-1] if self.gpu_freqs else 0)
@@ -658,6 +659,20 @@ class Hud(Gtk.ApplicationWindow):
         self.k_gpu_label.set_label(f"{clock} MHz" if level == "manual" else "auto")
         self.syncing = False
         return False
+
+    def enforce_governor(self):
+        # Debounced: powerd sets its own governor right after a profile change.
+        if self.governor_timer:
+            GLib.source_remove(self.governor_timer)
+
+        def apply():
+            self.governor_timer = None
+            want = PROFILE_GOVERNOR.get(self.power.get("Profile"))
+            if want and want != self.power.get("CpuScalingGovernor") \
+                    and want in self.power.get("AvailableCpuScalingGovernors", [want]):
+                self.power.set("CpuScalingGovernor", GLib.Variant("s", want))
+            return False
+        self.governor_timer = GLib.timeout_add(400, apply)
 
     def pick_gpu_mode(self, mode):
         self.power.set("GpuPerformanceLevel", GLib.Variant("s", mode))
