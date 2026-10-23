@@ -73,6 +73,25 @@ def read_int(path, default=0):
         return default
 
 
+def display_max_hz(default=120):
+    """Top refresh rate of the main gamescope (the one writing the stats pipe)."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or not read(f"/proc/{pid}/comm").startswith("gamescope"):
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        if "-T" in args and "--custom-refresh-rates" in args:
+            rates = args[args.index("--custom-refresh-rates") + 1]
+            try:
+                return max(int(r) for r in rates.split(","))
+            except ValueError:
+                pass
+    return default
+
+
 def uevent(path):
     out = {}
     for line in read(f"{path}/uevent").splitlines():
@@ -327,6 +346,7 @@ class FpsPanel(Gtk.DrawingArea):
         super().__init__(hexpand=True, vexpand=True)
         self.history = collections.deque(maxlen=120)
         self.fps, self.focus = None, ""
+        self.max_hz = display_max_hz()
         self.set_draw_func(self.draw)
 
     def push(self, fps, focus):
@@ -336,8 +356,8 @@ class FpsPanel(Gtk.DrawingArea):
 
     def draw(self, _area, cr, w, h):
         pad = 10
-        top = min(MAX_FPS, max(30, max(self.history, default=60) * 1.15))
-        top = 30 * math.ceil(top / 30)
+        top = max(30, max(self.history, default=60) * 1.15)
+        top = min(self.max_hz, 30 * math.ceil(top / 30))
         gx, gw = pad, w - 2 * pad
         gy, gh = h * 0.50, h * 0.50 - pad
         # Reference lines at 30 / 60 / 90 / 120.
