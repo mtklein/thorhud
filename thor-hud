@@ -629,10 +629,10 @@ class Hud(Gtk.ApplicationWindow):
             self.g_gpu.update(s["gpu"], f"{s['gpu']:.0f}%", gpu_sub)
         charging = s["bat_status"] in ("Charging", "Full") or s["usb_w"] > 0.5
         if charging:
-            self.g_pwr.update(s["usb_w"], f"{s['usb_w']:.1f}", "from USB", NEUTRAL)
+            self.g_pwr.update(s["usb_w"], f"+{s['usb_w']:.1f}", "USB", NEUTRAL)
         else:
             pc = heat_color(s["bat_w"], POWER_SCALE)
-            self.g_pwr.update(s["bat_w"], f"{s['bat_w']:.1f}", "draw", pc,
+            self.g_pwr.update(s["bat_w"], f"{s['bat_w']:.1f}", "", pc,
                               pc if s["bat_w"] >= POWER_SCALE[2][0] else None)
         hot = max(s["cpu_temp"], s["gpu_temp"])
         fan = f"fan {s['fan_rpm']}" if s["fan_rpm"] is not None else f"bat {s['bat_temp']:.0f}°"
