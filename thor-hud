@@ -404,18 +404,18 @@ class FpsPanel(Gtk.DrawingArea):
             cr.set_line_width(1.5)
             cr.stroke()
         shown = f"{self.fps:.0f}" if self.fps is not None else "idle"
-        tw = text(cr, self, shown, pad, pad, big, TEXT if self.fps is not None else DIM,
-                  align="left", anchor="top")
-        text(cr, self, "FPS", pad + tw + 6, pad + big * 0.9, big * 0.36, DIM, align="left", anchor="bottom")
+        uw = text(cr, self, "FPS", w - pad, pad + big * 0.9, big * 0.36, DIM, align="right", anchor="bottom")
+        text(cr, self, shown, w - pad - uw - 6, pad, big, TEXT if self.fps is not None else DIM,
+             align="right", anchor="top")
         mid = pad + big * 0.6
         if self.focus:
             text(cr, self, app_name(self.focus), w / 2, mid, big * 0.36, TEXT,
                  Pango.Weight.NORMAL, "center", "middle", max_width=w * 0.45)
         if self.battery:
-            text(cr, self, self.battery, w - pad, mid, big * 0.5, self.battery_color,
-                 align="right", anchor="bottom")
-            text(cr, self, self.battery_sub, w - pad, mid + 2, big * 0.3, DIM,
-                 Pango.Weight.NORMAL, "right", "top")
+            text(cr, self, self.battery, pad, mid, big * 0.5, self.battery_color,
+                 align="left", anchor="bottom")
+            text(cr, self, self.battery_sub, pad, mid + 2, big * 0.3, DIM,
+                 Pango.Weight.NORMAL, "left", "top")
 
 
 # ---------------------------------------------------------------- app
@@ -423,7 +423,6 @@ class FpsPanel(Gtk.DrawingArea):
 CSS = b"""
 window, .root { background: #000; color: #e5e8eb; font-family: "Noto Sans"; }
 .card { background: #0e1012; border-radius: 14px; padding: 6px; }
-.knobs label.caption { color: #82878c; font-size: 11px; font-weight: bold; letter-spacing: 1px; }
 .seg button { background: #1a1d21; color: #82878c; border: none; box-shadow: none;
               min-height: 34px; padding: 0 6px; font-weight: bold; font-size: 13px; border-radius: 0; }
 .seg button:first-child { border-radius: 10px 0 0 10px; }
@@ -521,21 +520,18 @@ class Hud(Gtk.ApplicationWindow):
             gauges.append(self.card(g))
         root.append(gauges)
 
-        knobs = Gtk.Grid(column_spacing=10, row_spacing=6, css_classes=["card", "knobs"])
-        knobs.set_margin_top(0)
+        knobs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, css_classes=["card"])
         root.append(knobs)
 
         profiles = self.power.get("AvailableProfiles", ["Eco", "Balanced", "Performance"])
         self.k_profile = Segmented([(p, p) for p in profiles],
                                    lambda v: self.power.set("Profile", GLib.Variant("s", v)), "profile")
-        self.k_gpu = Segmented([("auto", "Auto"), ("max", "Max")], self.pick_gpu, "gpu")
+        self.k_gpu = Segmented([("auto", "Auto"), ("max", "Max GPU")], self.pick_gpu, "gpu")
         self.governor_timer = None
         self.syncing = False
 
-        knobs.attach(Gtk.Label(label="PROFILE", xalign=0, css_classes=["caption"]), 0, 0, 1, 1)
-        knobs.attach(self.k_profile, 1, 0, 2, 1)
-        knobs.attach(Gtk.Label(label="GPU CLK", xalign=0, css_classes=["caption"]), 0, 1, 1, 1)
-        knobs.attach(self.k_gpu, 1, 1, 2, 1)
+        knobs.append(self.k_profile)
+        knobs.append(self.k_gpu)
 
         self.sync_knobs()
         self.tick()
@@ -639,7 +635,7 @@ class App(Gtk.Application):
             win.fullscreen()
         win.present()
         if "--snapshot" in sys.argv:
-            GLib.timeout_add(8000, self.snapshot, win)
+            GLib.timeout_add(8000, lambda: GLib.timeout_add(500, self.snapshot, win) and False)
 
     def snapshot(self, win):
         paintable = Gtk.WidgetPaintable.new(win)
@@ -647,6 +643,8 @@ class App(Gtk.Application):
         snap = Gtk.Snapshot()
         paintable.snapshot(snap, w, h)
         node = snap.to_node()
+        if node is None:  # not drawn yet (e.g. not mapped); try again shortly
+            return True
         renderer = win.get_native().get_renderer()
         tex = renderer.render_texture(node, None)
         tex.save_to_png(sys.argv[sys.argv.index("--snapshot") + 1])
