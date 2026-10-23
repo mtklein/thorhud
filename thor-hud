@@ -548,7 +548,7 @@ class Hud(Gtk.ApplicationWindow):
         self.g_pwr = Gauge("WATTS", NEUTRAL, 15)
         self.g_tmp = Gauge("°C", TEMP_SCALE[0][1], 95, minimum=45)
         self.g_ram = Gauge("RAM", NEUTRAL, 100)
-        for g in (self.g_cpu, self.g_gpu, self.g_ram, self.g_pwr, self.g_tmp):
+        for g in (self.g_pwr, self.g_cpu, self.g_gpu, self.g_ram, self.g_tmp):
             g.set_size_request(-1, 112)
             gauges.append(self.card(g))
         root.append(gauges)
