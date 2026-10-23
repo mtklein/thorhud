@@ -8,6 +8,10 @@ Environment=WAYLAND_DISPLAY=armada-plasma-bottom GDK_BACKEND=wayland
 UnsetEnvironment=DISPLAY
 ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S "$XDG_RUNTIME_DIR/armada-plasma-bottom" ] && exit 0; sleep 1; done; exit 1'
 ExecStart=%h/.local/bin/thor-hud
+# Stay on the little cores and yield to everything else, so the HUD never
+# takes time from the game (cores 3-7) or gamescope (core 7).
+CPUAffinity=0-2
+Nice=10
 Restart=on-failure
 RestartSec=3
 
