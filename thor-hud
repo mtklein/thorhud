@@ -45,7 +45,7 @@ NEUTRAL = hexc("#9facba")   # slate (fps, ram, battery)
 WARN = hexc("#dea45f")
 BAD = hexc("#dd766f")
 # Heat scale (cool blue → khaki → amber → red), all near the same lightness
-# until hot. Used for temperature and battery draw; the number is tinted too
+# until hot. Used for temperature, battery draw and RAM; the number is tinted too
 # once a reading reaches amber.
 HEAT = [hexc("#89b0cd"), hexc("#b0ac8f"), hexc("#dea45f"), hexc("#e87a69")]
 
@@ -57,6 +57,7 @@ def heat_scale(cool, khaki, amber, hot):
 # The Thor idles around 55 °C, so the temperature scale starts there.
 TEMP_SCALE = heat_scale(55, 67, 77, 88)
 POWER_SCALE = heat_scale(5, 6.8, 8.3, 10)  # watts drawn from the battery
+RAM_SCALE = heat_scale(80, 85.5, 90, 95)   # % of memory in use
 
 
 def heat_color(t, scale):
@@ -623,7 +624,9 @@ class Hud(Gtk.ApplicationWindow):
         self.fps.battery, self.fps.battery_sub = f"{s['bat_pct']}%", eta
         self.fps.battery_color = low or TEXT
         ram = 100 * s["mem_used"] / s["mem_total"]
-        self.g_ram.update(ram, f"{ram:.0f}%", f"{s['mem_used']:.1f} of {s['mem_total']:.0f}G")
+        rc = heat_color(ram, RAM_SCALE)
+        self.g_ram.update(ram, f"{ram:.0f}%", f"{s['mem_used']:.1f} of {s['mem_total']:.0f}G", rc,
+                          rc if ram >= RAM_SCALE[2][0] else None)
         return True
 
 
