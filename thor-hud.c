@@ -259,7 +259,7 @@ static gpointer fps_reader(gpointer data) {
 // GPU utilisation from DRM fdinfo (drm-engine-gpu busy ns per client). Many fds
 // share one DRM client, so after each rescan we keep a single fdinfo path per
 // client and read only those each second.
-typedef struct { long long id; char path[288]; long long ns, prev; } GpuClient;
+typedef struct { long long id; char path[576]; long long ns, prev; } GpuClient;
 
 static struct {
     GpuClient clients[MAX_CLIENTS];
@@ -440,21 +440,84 @@ static void sample(Sample *s) {
 }
 
 // ---------------------------------------------------------------- drawing
+//
+// Everything is drawn as GTK render nodes (paths, strokes, text layouts), so
+// GTK's GPU renderer does the rasterising instead of Cairo filling a software
+// image for every widget each second.
 
-static void rgb(cairo_t *cr, Color c, double a) { cairo_set_source_rgba(cr, c.r, c.g, c.b, a); }
+typedef void (*DrawFn)(GtkWidget *w, GtkSnapshot *s, double width, double height, gpointer data);
+
+#define HUD_TYPE_CANVAS (hud_canvas_get_type())
+G_DECLARE_FINAL_TYPE(HudCanvas, hud_canvas, HUD, CANVAS, GtkWidget)
+
+struct _HudCanvas {
+    GtkWidget parent;
+    DrawFn draw;
+    gpointer data;
+};
+
+G_DEFINE_TYPE(HudCanvas, hud_canvas, GTK_TYPE_WIDGET)
+
+static void hud_canvas_snapshot(GtkWidget *w, GtkSnapshot *s) {
+    HudCanvas *c = HUD_CANVAS(w);
+    c->draw(w, s, gtk_widget_get_width(w), gtk_widget_get_height(w), c->data);
+}
+
+static void hud_canvas_class_init(HudCanvasClass *klass) { GTK_WIDGET_CLASS(klass)->snapshot = hud_canvas_snapshot; }
+static void hud_canvas_init(HudCanvas *c) { (void)c; }
+
+static GtkWidget *canvas_new(DrawFn draw, gpointer data) {
+    HudCanvas *c = g_object_new(HUD_TYPE_CANVAS, NULL);
+    c->draw = draw;
+    c->data = data;
+    gtk_widget_set_hexpand(GTK_WIDGET(c), TRUE);
+    gtk_widget_set_vexpand(GTK_WIDGET(c), TRUE);
+    return GTK_WIDGET(c);
+}
+
+static GdkRGBA rgba(Color c, double a) { return (GdkRGBA){c.r, c.g, c.b, a}; }
+
+// Strokes and frees path.
+static void stroke(GtkSnapshot *s, GskPath *path, double width, GskLineCap cap, Color c, double a) {
+    GskStroke *st = gsk_stroke_new(width);
+    gsk_stroke_set_line_cap(st, cap);
+    GdkRGBA col = rgba(c, a);
+    gtk_snapshot_append_stroke(s, path, st, &col);
+    gsk_stroke_free(st);
+    gsk_path_unref(path);
+}
+
+// Arc of radius r around (cx, cy) from angle a0 to a1 (radians, clockwise on screen).
+static GskPath *arc_path(double cx, double cy, double r, double a0, double a1) {
+    GskPathBuilder *b = gsk_path_builder_new();
+    if (a1 - a0 >= 2 * G_PI - 1e-6) {
+        gsk_path_builder_add_circle(b, &GRAPHENE_POINT_INIT(cx, cy), r);
+    } else {
+        gsk_path_builder_move_to(b, cx + r * cos(a0), cy + r * sin(a0));
+        gsk_path_builder_svg_arc_to(b, r, r, 0, a1 - a0 > G_PI, TRUE, cx + r * cos(a1), cy + r * sin(a1));
+    }
+    return gsk_path_builder_free_to_path(b);
+}
+
+static GskPath *line_path(double x0, double y0, double x1, double y1) {
+    GskPathBuilder *b = gsk_path_builder_new();
+    gsk_path_builder_move_to(b, x0, y0);
+    gsk_path_builder_line_to(b, x1, y1);
+    return gsk_path_builder_free_to_path(b);
+}
 
 typedef enum { LEFT, CENTER, RIGHT } Align;
 typedef enum { TOP, MIDDLE, BOTTOM } Anchor;
 
-// Draws s anchored at (x, y); returns its logical width.
-static double text(cairo_t *cr, const char *s, double x, double y, double size, Color color,
+// Draws str anchored at (x, y); returns its logical width.
+static double text(GtkWidget *w, GtkSnapshot *s, const char *str, double x, double y, double size, Color color,
                    PangoWeight weight, Align align, Anchor anchor, double max_width) {
     static PangoAttrList *tnum;
     if (!tnum) {
         tnum = pango_attr_list_new();
         pango_attr_list_insert(tnum, pango_attr_font_features_new("tnum"));
     }
-    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(w));
     PangoFontDescription *desc = pango_font_description_new();
     pango_font_description_set_family_static(desc, "Noto Sans");
     pango_font_description_set_weight(desc, weight);
@@ -466,14 +529,16 @@ static double text(cairo_t *cr, const char *s, double x, double y, double size, 
         pango_layout_set_width(layout, (int)(max_width * PANGO_SCALE));
         pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
     }
-    pango_layout_set_text(layout, s, -1);
+    pango_layout_set_text(layout, str, -1);
     PangoRectangle ext;
     pango_layout_get_pixel_extents(layout, NULL, &ext);
     double dx = align == CENTER ? -ext.width / 2.0 - ext.x : align == LEFT ? -ext.x : -ext.width - ext.x;
     double dy = anchor == MIDDLE ? -ext.height / 2.0 - ext.y : anchor == TOP ? -ext.y : -ext.height - ext.y;
-    rgb(cr, color, 1);
-    cairo_move_to(cr, x + dx, y + dy);
-    pango_cairo_show_layout(cr, layout);
+    GdkRGBA col = rgba(color, 1);
+    gtk_snapshot_save(s);
+    gtk_snapshot_translate(s, &GRAPHENE_POINT_INIT(x + dx, y + dy));
+    gtk_snapshot_append_layout(s, layout, &col);
+    gtk_snapshot_restore(s);
     g_object_unref(layout);
     return ext.width;
 }
@@ -487,29 +552,21 @@ typedef struct {
     char display[32], sub[64];
 } Gauge;
 
-static void gauge_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer data) {
-    (void)area;
+static void gauge_draw(GtkWidget *w, GtkSnapshot *s, double width, double height, gpointer data) {
     Gauge *g = data;
-    double r = MIN(w, h * 1.02) / 2 - 6;
-    double cx = w / 2.0, cy = h / 2.0 + r * 0.08;
+    double r = MIN(width, height * 1.02) / 2 - 6;
+    double cx = width / 2, cy = height / 2 + r * 0.08;
     double lw = MAX(4.0, r * 0.13);
     double start = 135 * G_PI / 180, sweep = 270 * G_PI / 180;
-    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-    cairo_set_line_width(cr, lw);
-    rgb(cr, TRACK, 1);
-    cairo_arc(cr, cx, cy, r - lw / 2, start, start + sweep);
-    cairo_stroke(cr);
+    stroke(s, arc_path(cx, cy, r - lw / 2, start, start + sweep), lw, GSK_LINE_CAP_ROUND, TRACK, 1);
     if (!isnan(g->value)) {
         double frac = CLAMP((g->value - g->minimum) / (g->maximum - g->minimum), 0.0, 1.0);
-        if (frac > 0.005) {
-            rgb(cr, g->arc_color, 1);
-            cairo_arc(cr, cx, cy, r - lw / 2, start, start + sweep * frac);
-            cairo_stroke(cr);
-        }
+        if (frac > 0.005)
+            stroke(s, arc_path(cx, cy, r - lw / 2, start, start + sweep * frac), lw, GSK_LINE_CAP_ROUND, g->arc_color, 1);
     }
-    text(cr, g->display, cx, cy - r * 0.04, r * 0.48, g->value_color, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
-    text(cr, g->label, cx, cy + r * 0.42, r * 0.19, DIM, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
-    if (*g->sub) text(cr, g->sub, cx, cy + r * 0.82, r * 0.18, DIM, PANGO_WEIGHT_NORMAL, CENTER, MIDDLE, 0);
+    text(w, s, g->display, cx, cy - r * 0.04, r * 0.48, g->value_color, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
+    text(w, s, g->label, cx, cy + r * 0.42, r * 0.19, DIM, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
+    if (*g->sub) text(w, s, g->sub, cx, cy + r * 0.82, r * 0.18, DIM, PANGO_WEIGHT_NORMAL, CENTER, MIDDLE, 0);
 }
 
 static Gauge *gauge_new(const char *label, Color color, double maximum, double minimum) {
@@ -521,21 +578,26 @@ static Gauge *gauge_new(const char *label, Color color, double maximum, double m
     g->maximum = maximum;
     g->value = NAN;
     g_strlcpy(g->display, "–", sizeof g->display);
-    g->area = gtk_drawing_area_new();
-    gtk_widget_set_hexpand(g->area, TRUE);
-    gtk_widget_set_vexpand(g->area, TRUE);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(g->area), gauge_draw, g, NULL);
+    g->area = canvas_new(gauge_draw, g);
     return g;
 }
 
-// arc_color / value_color: NULL means the gauge's own colour / TEXT.
+static gboolean same_color(Color a, Color b) { return a.r == b.r && a.g == b.g && a.b == b.b; }
+
+// arc_color / value_color: NULL means the gauge's own colour / TEXT. Only
+// redraws when something visible changed.
 static void gauge_update(Gauge *g, double value, const char *display, const char *sub,
                          const Color *arc_color, const Color *value_color) {
+    Color arc = arc_color ? *arc_color : g->color, val = value_color ? *value_color : TEXT;
+    double span = g->maximum - g->minimum;
+    gboolean same = !isnan(g->value) && fabs(value - g->value) < span * 0.002 && !strcmp(display, g->display) &&
+                    !strcmp(sub, g->sub) && same_color(arc, g->arc_color) && same_color(val, g->value_color);
+    if (same) return;
     g->value = value;
     g_strlcpy(g->display, display, sizeof g->display);
     g_strlcpy(g->sub, sub, sizeof g->sub);
-    g->arc_color = arc_color ? *arc_color : g->color;
-    g->value_color = value_color ? *value_color : TEXT;
+    g->arc_color = arc;
+    g->value_color = val;
     gtk_widget_queue_draw(g->area);
 }
 
@@ -560,59 +622,49 @@ static void panel_push(double fps, const char *focus) {
     gtk_widget_queue_draw(panel.area);
 }
 
-static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer data) {
-    (void)area;
+static void panel_draw(GtkWidget *w, GtkSnapshot *s, double width, double height, gpointer data) {
     (void)data;
     double pad = 10, top = panel.max_hz;  // fixed scale: 0 to the display's top refresh rate
-    double gx = pad, gw = w - 2 * pad;
-    double big = MIN(h * 0.34, 44);
+    double gx = pad, gw = width - 2 * pad;
+    double big = MIN(height * 0.34, 44);
     double gy = pad + big * 1.4 + 6;  // graph starts below the readout's line box
-    double gh = h - gy - pad;
+    double gh = height - gy - pad;
 
     // Reference lines at the key frame rates, labelled on the left.
-    cairo_set_line_width(cr, 1);
     int refs[G_N_ELEMENTS(reference_fps) + 1], n_refs = 0;
     for (size_t i = 0; i < G_N_ELEMENTS(reference_fps); i++)
         if (reference_fps[i] < top) refs[n_refs++] = reference_fps[i];
     refs[n_refs++] = (int)top;
     for (int i = 0; i < n_refs; i++) {
         double y = gy + gh - gh * refs[i] / top;
-        rgb(cr, TRACK, 0.7);
-        cairo_new_path(cr);
-        cairo_move_to(cr, gx, y);
-        cairo_line_to(cr, gx + gw, y);
-        cairo_stroke(cr);
+        stroke(s, line_path(gx, y, gx + gw, y), 1, GSK_LINE_CAP_BUTT, TRACK, 0.7);
         char label[16];
         snprintf(label, sizeof label, "%d", refs[i]);
-        text(cr, label, gx, y - 2, 10, DIM, PANGO_WEIGHT_NORMAL, LEFT, BOTTOM, 0);
+        text(w, s, label, gx, y - 2, 10, DIM, PANGO_WEIGHT_NORMAL, LEFT, BOTTOM, 0);
     }
 
     // History, as one filled line per contiguous stretch of readings.
     double step = gw / (HISTORY - 1), x0 = gx + gw - step * (panel.count - 1);
-    cairo_new_path(cr);
-    cairo_set_line_width(cr, 1.5);
     for (int i = 0; i < panel.count;) {
         if (isnan(panel.history[i])) { i++; continue; }
         int j = i;
         while (j < panel.count && !isnan(panel.history[j])) j++;
         if (j - i >= 2) {
-            for (int pass = 0; pass < 2; pass++) {
-                if (pass == 0) cairo_move_to(cr, x0 + i * step, gy + gh);
-                for (int k = i; k < j; k++) {
-                    double y = gy + gh - gh * MIN(panel.history[k], top) / top;
-                    if (pass == 1 && k == i) cairo_move_to(cr, x0 + k * step, y);
-                    else cairo_line_to(cr, x0 + k * step, y);
-                }
-                if (pass == 0) {
-                    cairo_line_to(cr, x0 + (j - 1) * step, gy + gh);
-                    cairo_close_path(cr);
-                    rgb(cr, NEUTRAL, 0.08);
-                    cairo_fill(cr);
-                } else {
-                    rgb(cr, NEUTRAL, 1);
-                    cairo_stroke(cr);
-                }
+            GskPathBuilder *area = gsk_path_builder_new(), *line = gsk_path_builder_new();
+            gsk_path_builder_move_to(area, x0 + i * step, gy + gh);
+            for (int k = i; k < j; k++) {
+                double x = x0 + k * step, y = gy + gh - gh * MIN(panel.history[k], top) / top;
+                gsk_path_builder_line_to(area, x, y);
+                if (k == i) gsk_path_builder_move_to(line, x, y);
+                else gsk_path_builder_line_to(line, x, y);
             }
+            gsk_path_builder_line_to(area, x0 + (j - 1) * step, gy + gh);
+            gsk_path_builder_close(area);
+            GskPath *fill = gsk_path_builder_free_to_path(area);
+            GdkRGBA col = rgba(NEUTRAL, 0.08);
+            gtk_snapshot_append_fill(s, fill, GSK_FILL_RULE_WINDING, &col);
+            gsk_path_unref(fill);
+            stroke(s, gsk_path_builder_free_to_path(line), 1.5, GSK_LINE_CAP_BUTT, NEUTRAL, 1);
         }
         i = j;
     }
@@ -620,31 +672,26 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int w, int h, gpointer
     if (!isnan(panel.fps)) {  // blank when gamescope has nothing recent
         char fps[16];
         snprintf(fps, sizeof fps, "%.0f", panel.fps);
-        double uw = text(cr, "FPS", w - pad, pad + big * 0.9, big * 0.36, DIM, PANGO_WEIGHT_BOLD, RIGHT, BOTTOM, 0);
-        text(cr, fps, w - pad - uw - 6, pad, big, TEXT, PANGO_WEIGHT_BOLD, RIGHT, TOP, 0);
+        double uw = text(w, s, "FPS", width - pad, pad + big * 0.9, big * 0.36, DIM, PANGO_WEIGHT_BOLD, RIGHT, BOTTOM, 0);
+        text(w, s, fps, width - pad - uw - 6, pad, big, TEXT, PANGO_WEIGHT_BOLD, RIGHT, TOP, 0);
     }
     double mid = pad + big * 0.6;
     if (*panel.focus)
-        text(cr, app_name(panel.focus), w / 2.0, mid, big * 0.36, TEXT, PANGO_WEIGHT_NORMAL, CENTER, MIDDLE, w * 0.45);
+        text(w, s, app_name(panel.focus), width / 2, mid, big * 0.36, TEXT, PANGO_WEIGHT_NORMAL, CENTER, MIDDLE,
+             width * 0.45);
     if (panel.battery >= 0) {
         // Small ring meter around the percentage.
         double r = big * 0.58, cx = pad + r, lw = 3.5;
-        cairo_set_line_width(cr, lw);
-        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-        rgb(cr, TRACK, 1);
-        cairo_new_path(cr);  // text drawing leaves a current point that arc() would join
-        cairo_arc(cr, cx, mid, r - lw / 2, 0, 2 * G_PI);
-        cairo_stroke(cr);
+        stroke(s, arc_path(cx, mid, r - lw / 2, 0, 2 * G_PI), lw, GSK_LINE_CAP_ROUND, TRACK, 1);
         if (panel.battery > 0) {
-            rgb(cr, battery_color(panel.battery), 1);
             double start = -G_PI / 2;
-            cairo_arc(cr, cx, mid, r - lw / 2, start, start + 2 * G_PI * MIN(panel.battery, 100) / 100);
-            cairo_stroke(cr);
+            stroke(s, arc_path(cx, mid, r - lw / 2, start, start + 2 * G_PI * MIN(panel.battery, 100) / 100), lw,
+                   GSK_LINE_CAP_ROUND, battery_color(panel.battery), 1);
         }
         char pct[16];
         snprintf(pct, sizeof pct, "%d%%", panel.battery);
-        text(cr, pct, cx, mid, big * 0.3, TEXT, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
-        text(cr, panel.battery_sub, pad + 2 * r + 8, mid, big * 0.3, DIM, PANGO_WEIGHT_NORMAL, LEFT, MIDDLE, 0);
+        text(w, s, pct, cx, mid, big * 0.3, TEXT, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
+        text(w, s, panel.battery_sub, pad + 2 * r + 8, mid, big * 0.3, DIM, PANGO_WEIGHT_NORMAL, LEFT, MIDDLE, 0);
     }
 }
 
@@ -919,11 +966,8 @@ static void activate(GtkApplication *app, gpointer data) {
     gtk_widget_set_margin_end(root, 8);
     gtk_window_set_child(GTK_WINDOW(win), root);
 
-    panel.area = gtk_drawing_area_new();
-    gtk_widget_set_hexpand(panel.area, TRUE);
-    gtk_widget_set_vexpand(panel.area, TRUE);
+    panel.area = canvas_new(panel_draw, NULL);
     gtk_widget_set_size_request(panel.area, -1, 120);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(panel.area), panel_draw, NULL, NULL);
     gtk_box_append(GTK_BOX(root), card(panel.area, TRUE));
 
     GtkWidget *gauges = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);

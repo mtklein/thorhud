@@ -30,7 +30,7 @@ toolbox run -c fedora-toolbox-44 make
 On the Thor (user `armada`), from the repo:
 
 ```bash
-cp thor-hud ~/.local/bin/
+install -m755 thor-hud ~/.local/bin/thor-hud.new && mv -f ~/.local/bin/thor-hud.new ~/.local/bin/thor-hud
 cp thor-hud.service ~/.config/systemd/user/
 cp thor-hud.desktop ~/.local/share/applications/
 systemctl --user daemon-reload && systemctl --user enable --now thor-hud.service
