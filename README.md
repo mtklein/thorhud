@@ -11,7 +11,7 @@ overlay.
   Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):
   Eco → conservative, Balanced → schedutil, Performance → performance
 
-Colours are muted and equal in lightness; only temperature (blue → amber → red)
+Colours are muted and equal in lightness; only temperature and battery draw (blue → amber → red)
 and low battery change colour with their value.
 
 ## Install

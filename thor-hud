@@ -41,24 +41,32 @@ DIM = hexc("#82878c")
 TEXT = hexc("#e5e8eb")
 CPU_C = hexc("#8bafcf")     # blue
 GPU_C = hexc("#ada4cd")     # violet
-PWR_C = hexc("#c2a681")     # sand
 NEUTRAL = hexc("#9facba")   # slate (fps, ram, battery)
 WARN = hexc("#dea45f")
 BAD = hexc("#dd766f")
-# Temperature scale stops (°C → colour), all near the same lightness until hot.
-# The Thor idles around 55 °C, so the scale starts there.
-TEMP_SCALE = [(55, hexc("#89b0cd")), (67, hexc("#b0ac8f")), (77, hexc("#dea45f")), (88, hexc("#e87a69"))]
-TEMP_TINT = 77  # tint the number too from here up
+# Heat scale (cool blue → khaki → amber → red), all near the same lightness
+# until hot. Used for temperature and battery draw; the number is tinted too
+# once a reading reaches amber.
+HEAT = [hexc("#89b0cd"), hexc("#b0ac8f"), hexc("#dea45f"), hexc("#e87a69")]
 
 
-def temp_color(t):
-    if t <= TEMP_SCALE[0][0]:
-        return TEMP_SCALE[0][1]
-    for (t0, c0), (t1, c1) in zip(TEMP_SCALE, TEMP_SCALE[1:]):
+def heat_scale(cool, khaki, amber, hot):
+    return list(zip((cool, khaki, amber, hot), HEAT))
+
+
+# The Thor idles around 55 °C, so the temperature scale starts there.
+TEMP_SCALE = heat_scale(55, 67, 77, 88)
+POWER_SCALE = heat_scale(5, 6.8, 8.3, 10)  # watts drawn from the battery
+
+
+def heat_color(t, scale):
+    if t <= scale[0][0]:
+        return scale[0][1]
+    for (t0, c0), (t1, c1) in zip(scale, scale[1:]):
         if t <= t1:
             f = (t - t0) / (t1 - t0)
             return tuple(a + (b - a) * f for a, b in zip(c0, c1))
-    return TEMP_SCALE[-1][1]
+    return scale[-1][1]
 
 
 def read(path, default=""):
@@ -512,7 +520,7 @@ class Hud(Gtk.ApplicationWindow):
         gauges = Gtk.Box(spacing=8, homogeneous=True)
         self.g_cpu = Gauge("CPU", CPU_C, 100)
         self.g_gpu = Gauge("GPU", GPU_C, 100)
-        self.g_pwr = Gauge("WATTS", PWR_C, 20)
+        self.g_pwr = Gauge("WATTS", NEUTRAL, 15)
         self.g_tmp = Gauge("°C", TEMP_SCALE[0][1], 95, minimum=45)
         self.g_ram = Gauge("RAM", NEUTRAL, 100)
         for g in (self.g_cpu, self.g_gpu, self.g_ram, self.g_pwr, self.g_tmp):
@@ -596,13 +604,15 @@ class Hud(Gtk.ApplicationWindow):
             self.g_gpu.update(s["gpu"], f"{s['gpu']:.0f}%", gpu_sub)
         charging = s["bat_status"] in ("Charging", "Full") or s["usb_w"] > 0.5
         if charging:
-            self.g_pwr.update(s["usb_w"], f"{s['usb_w']:.1f}", "from USB")
+            self.g_pwr.update(s["usb_w"], f"{s['usb_w']:.1f}", "from USB", NEUTRAL)
         else:
-            self.g_pwr.update(s["bat_w"], f"{s['bat_w']:.1f}", "draw")
+            pc = heat_color(s["bat_w"], POWER_SCALE)
+            self.g_pwr.update(s["bat_w"], f"{s['bat_w']:.1f}", "draw", pc,
+                              pc if s["bat_w"] >= POWER_SCALE[2][0] else None)
         hot = max(s["cpu_temp"], s["gpu_temp"])
         fan = f"fan {s['fan_rpm']}" if s["fan_rpm"] is not None else f"bat {s['bat_temp']:.0f}°"
-        tc = temp_color(hot)
-        self.g_tmp.update(hot, f"{hot:.0f}", fan, tc, tc if hot >= TEMP_TINT else None)
+        tc = heat_color(hot, TEMP_SCALE)
+        self.g_tmp.update(hot, f"{hot:.0f}", fan, tc, tc if hot >= TEMP_SCALE[2][0] else None)
         eta = ""
         if s["bat_eta"] is not None:
             hours = s["bat_eta"]
