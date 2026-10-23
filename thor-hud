@@ -274,8 +274,6 @@ class Sampler:
                 name,
                 sum(usage) / len(usage) if usage else 0.0,
                 read_int(f"{base}/scaling_cur_freq") // 1000,
-                read_int(f"{base}/scaling_max_freq") // 1000,
-                read_int(f"{base}/cpuinfo_max_freq") // 1000,
             ))
         s["gpu"] = self.gpu.sample()
         if GPU_DEVFREQ:
@@ -446,7 +444,7 @@ class FpsPanel(Gtk.DrawingArea):
 
 
 class Bars(Gtk.DrawingArea):
-    """Rows of thin labelled bars (CPU clusters, RAM)."""
+    """Rows of thin labelled bars (CPU cluster load, RAM)."""
 
     def __init__(self):
         super().__init__(hexpand=True, vexpand=True)
@@ -464,7 +462,7 @@ class Bars(Gtk.DrawingArea):
         size = min(rh * 0.55, 15)
         lx, vx = 10, w - 10
         bx0, bx1 = 10 + size * 4.6, w - 10 - size * 7.2
-        for i, (label, frac, cap, value, color) in enumerate(self.rows):
+        for i, (label, frac, value, color) in enumerate(self.rows):
             cy = rh * i + rh / 2
             text(cr, self, label, lx, cy, size * 0.8, DIM, align="left")
             bh = max(4, rh * 0.22)
@@ -478,13 +476,6 @@ class Bars(Gtk.DrawingArea):
                 rgb(cr, color)
                 cr.move_to(bx0, cy)
                 cr.line_to(bx0 + (bx1 - bx0) * min(1, frac), cy)
-                cr.stroke()
-            if cap is not None and cap < 0.999:
-                x = bx0 + (bx1 - bx0) * cap
-                rgb(cr, DIM)
-                cr.set_line_width(2)
-                cr.move_to(x, cy - bh)
-                cr.line_to(x, cy + bh)
                 cr.stroke()
             text(cr, self, value, vx, cy, size * 0.8, TEXT, Pango.Weight.NORMAL, align="right")
 
@@ -691,10 +682,9 @@ class Hud(Gtk.ApplicationWindow):
         low = None if charging else BAD if s["bat_pct"] <= 10 else WARN if s["bat_pct"] <= 20 else None
         self.g_bat.update(s["bat_pct"], f"{s['bat_pct']}", eta, low, low)
         rows = []
-        for name, usage, cur, cap, hw in s["clusters"]:
-            rows.append((name, usage / 100, cap / hw if hw else None,
-                         f"{usage:3.0f}% {cur / 1000:.2f}G", CPU_C))
-        rows.append(("RAM", s["mem_used"] / s["mem_total"], None,
+        for name, usage, cur in s["clusters"]:
+            rows.append((name, usage / 100, f"{usage:3.0f}% {cur / 1000:.2f}G", CPU_C))
+        rows.append(("RAM", s["mem_used"] / s["mem_total"],
                      f"{s['mem_used']:.1f}/{s['mem_total']:.0f}G", NEUTRAL))
         self.bars.update(rows)
         return True
