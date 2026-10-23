@@ -412,10 +412,9 @@ class FpsPanel(Gtk.DrawingArea):
             rgb(cr, NEUTRAL)
             cr.set_line_width(1.5)
             cr.stroke()
-        shown = f"{self.fps:.0f}" if self.fps is not None else "idle"
-        uw = text(cr, self, "FPS", w - pad, pad + big * 0.9, big * 0.36, DIM, align="right", anchor="bottom")
-        text(cr, self, shown, w - pad - uw - 6, pad, big, TEXT if self.fps is not None else DIM,
-             align="right", anchor="top")
+        if self.fps is not None:  # blank when gamescope has nothing recent
+            uw = text(cr, self, "FPS", w - pad, pad + big * 0.9, big * 0.36, DIM, align="right", anchor="bottom")
+            text(cr, self, f"{self.fps:.0f}", w - pad - uw - 6, pad, big, TEXT, align="right", anchor="top")
         mid = pad + big * 0.6
         if self.focus:
             text(cr, self, app_name(self.focus), w / 2, mid, big * 0.36, TEXT,
