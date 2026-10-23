@@ -45,7 +45,9 @@ NEUTRAL = hexc("#9facba")   # slate (fps, ram, battery)
 WARN = hexc("#dea45f")
 BAD = hexc("#dd766f")
 # Temperature scale stops (°C → colour), all near the same lightness until hot.
-TEMP_SCALE = [(35, hexc("#89b0cd")), (60, hexc("#b0ac8f")), (75, hexc("#dea45f")), (88, hexc("#e87a69"))]
+# The Thor idles around 55 °C, so the scale starts there.
+TEMP_SCALE = [(55, hexc("#89b0cd")), (67, hexc("#b0ac8f")), (77, hexc("#dea45f")), (88, hexc("#e87a69"))]
+TEMP_TINT = 77  # tint the number too from here up
 
 
 def temp_color(t):
@@ -339,9 +341,9 @@ def text(cr, widget, s, x, y, size, color, weight=Pango.Weight.BOLD, align="cent
 class Gauge(Gtk.DrawingArea):
     """270° arc meter with a big centre value and a small caption."""
 
-    def __init__(self, label, color, maximum):
+    def __init__(self, label, color, maximum, minimum=0):
         super().__init__(hexpand=True, vexpand=True)
-        self.label, self.color, self.maximum = label, color, maximum
+        self.label, self.color, self.minimum, self.maximum = label, color, minimum, maximum
         self.value, self.display, self.sub, self.arc_color = None, "–", "", color
         self.value_color = TEXT
         self.set_draw_func(self.draw)
@@ -363,7 +365,7 @@ class Gauge(Gtk.DrawingArea):
         cr.arc(cx, cy, r - lw / 2, start, start + sweep)
         cr.stroke()
         if self.value is not None:
-            frac = max(0.0, min(1.0, self.value / self.maximum))
+            frac = max(0.0, min(1.0, (self.value - self.minimum) / (self.maximum - self.minimum)))
             if frac > 0.005:
                 rgb(cr, self.arc_color)
                 cr.arc(cx, cy, r - lw / 2, start, start + sweep * frac)
@@ -395,15 +397,18 @@ class FpsPanel(Gtk.DrawingArea):
         top = min(self.max_hz, 30 * math.ceil(top / 30))
         gx, gw = pad, w - 2 * pad
         gy, gh = h * 0.50, h * 0.50 - pad
-        # Reference lines at 30 / 60 / 90 / 120.
+        # Reference lines every 30 fps; label every 60 (or 30 on a short scale),
+        # on the left, clear of the app name.
         cr.set_line_width(1)
+        label_step = 30 if top <= 60 else 60
         for ref in range(30, int(top) + 1, 30):
             y = gy + gh - gh * ref / top
             rgb(cr, TRACK, 0.7)
             cr.move_to(gx, y)
             cr.line_to(gx + gw, y)
             cr.stroke()
-            text(cr, self, str(ref), gx + gw, y - 2, 10, DIM, Pango.Weight.NORMAL, "right", "bottom")
+            if ref % label_step == 0:
+                text(cr, self, str(ref), gx, y - 2, 10, DIM, Pango.Weight.NORMAL, "left", "bottom")
         pts = list(self.history)
         if len(pts) > 1:
             step = gw / (self.history.maxlen - 1)
@@ -586,7 +591,7 @@ class Hud(Gtk.ApplicationWindow):
         self.g_cpu = Gauge("CPU", CPU_C, 100)
         self.g_gpu = Gauge("GPU", GPU_C, 100)
         self.g_pwr = Gauge("WATTS", PWR_C, 20)
-        self.g_tmp = Gauge("°C", TEMP_SCALE[0][1], 100)
+        self.g_tmp = Gauge("°C", TEMP_SCALE[0][1], 95, minimum=45)
         self.g_bat = Gauge("BATTERY", NEUTRAL, 100)
         for g in (self.g_cpu, self.g_gpu, self.g_pwr, self.g_tmp, self.g_bat):
             g.set_size_request(-1, 104)
@@ -694,7 +699,7 @@ class Hud(Gtk.ApplicationWindow):
         hot = max(s["cpu_temp"], s["gpu_temp"])
         fan = f"fan {s['fan_rpm']}" if s["fan_rpm"] is not None else f"bat {s['bat_temp']:.0f}°"
         tc = temp_color(hot)
-        self.g_tmp.update(hot, f"{hot:.0f}", fan, tc, tc if hot >= 75 else None)
+        self.g_tmp.update(hot, f"{hot:.0f}", fan, tc, tc if hot >= TEMP_TINT else None)
         eta = ""
         if s["bat_eta"] is not None:
             hours = s["bat_eta"]
