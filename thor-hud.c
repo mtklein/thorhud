@@ -3,17 +3,35 @@
 // Metrics: gamescope stats pipe (FPS, focused app), /proc and sysfs (CPU, GPU, power,
 // thermals, RAM, fan). Knobs: org.armada.Power on the system bus (profile, CPU
 // governor, GPU clock).
+//
+// A plain Wayland client: it draws its own pixels into shared-memory buffers
+// (see "raster" and "text" below) and handles its own touch input, with GLib
+// for the event loop and D-Bus.
 
+#define _GNU_SOURCE
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
-#include <gtk/gtk.h>
+#include <fontconfig/fontconfig.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <gio/gio.h>
+#include <glib-unix.h>
+#include <wayland-client.h>
+#include <zlib.h>
+
+#include "xdg-shell-client-protocol.h"
 
 #define MAX_FPS 240
 #define HISTORY 60  // one minute at 1 Hz
@@ -52,6 +70,7 @@ typedef struct { double r, g, b; } Color;
 // Battery ring bands: at or above this %, this colour. Plain good/bad signals,
 // so these carry more colour than the category accents.
 static Color battery_color(int pct) {
+    if (pct >= 100) return HEX(0x79b1e0);  // blue: full
     if (pct >= 40) return HEX(0x86b990);  // green
     if (pct >= 15) return HEX(0xd9c36a);  // yellow
     if (pct >= 5) return HEX(0xdd766f);   // red
@@ -98,34 +117,6 @@ static long long read_ll(const char *path, long long fallback) {
     char *end;
     long long v = strtoll(buf, &end, 10);
     return end == buf ? fallback : v;
-}
-
-// Value of "\nKEY=" in a sysfs uevent buffer (which starts with "\n").
-static long long uevent_ll(const char *buf, const char *key, long long fallback) {
-    char pat[64];
-    snprintf(pat, sizeof pat, "\nPOWER_SUPPLY_%s=", key);
-    const char *p = strstr(buf, pat);
-    return p ? strtoll(p + strlen(pat), NULL, 10) : fallback;
-}
-
-static void uevent_str(const char *buf, const char *key, char *out, size_t cap) {
-    char pat[64];
-    snprintf(pat, sizeof pat, "\nPOWER_SUPPLY_%s=", key);
-    const char *p = strstr(buf, pat);
-    out[0] = 0;
-    if (!p) return;
-    p += strlen(pat);
-    size_t n = strcspn(p, "\n");
-    if (n >= cap) n = cap - 1;
-    memcpy(out, p, n);
-    out[n] = 0;
-}
-
-static void read_uevent(const char *dir, char *buf, size_t cap) {
-    char path[256];
-    snprintf(path, sizeof path, "%s/uevent", dir);
-    buf[0] = '\n';
-    if (read_file(path, buf + 1, cap - 1) < 0) buf[1] = 0;
 }
 
 static gboolean is_pid(const char *s) {
@@ -226,45 +217,70 @@ static struct {
     char focus[64];
 } fps_state = {.fps = NAN};
 
+static void fps_line(const char *line) {
+    g_mutex_lock(&fps_state.lock);
+    if (!strncmp(line, "fps=", 4)) {
+        double fps = strtod(line + 4, NULL);
+        // gamescope occasionally reports absurd rates (near-zero frame
+        // intervals); no panel here goes past 240 Hz.
+        if (fps >= 0 && fps <= MAX_FPS) {
+            fps_state.fps = fps;
+            fps_state.stamp = g_get_monotonic_time();
+        }
+    } else if (!strncmp(line, "focus=", 6)) {
+        g_strlcpy(fps_state.focus, line + 6, sizeof fps_state.focus);
+    }
+    g_mutex_unlock(&fps_state.lock);
+}
+
+// Plain read(), not stdio: a thread blocked in fgets() holds its FILE's lock,
+// and exit() would wait on it forever while flushing streams.
 static gpointer fps_reader(gpointer data) {
     (void)data;
     char *pipe = g_strdup_printf("/run/user/%d/gamescope-stats/stats.pipe", getuid());
     for (;;) {
-        FILE *f = fopen(pipe, "re");
-        if (f) {
-            char line[256];
-            while (fgets(line, sizeof line, f)) {
-                line[strcspn(line, "\n")] = 0;
-                g_mutex_lock(&fps_state.lock);
-                if (!strncmp(line, "fps=", 4)) {
-                    double fps = strtod(line + 4, NULL);
-                    // gamescope occasionally reports absurd rates (near-zero frame
-                    // intervals); no panel here goes past 240 Hz.
-                    if (fps >= 0 && fps <= MAX_FPS) {
-                        fps_state.fps = fps;
-                        fps_state.stamp = g_get_monotonic_time();
-                    }
-                } else if (!strncmp(line, "focus=", 6)) {
-                    g_strlcpy(fps_state.focus, line + 6, sizeof fps_state.focus);
+        int fd = open(pipe, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[512];
+            size_t len = 0;
+            ssize_t n;
+            while ((n = read(fd, buf + len, sizeof buf - 1 - len)) > 0) {
+                len += n;
+                buf[len] = 0;
+                char *start = buf, *nl;
+                while ((nl = strchr(start, '\n'))) {
+                    *nl = 0;
+                    fps_line(start);
+                    start = nl + 1;
                 }
-                g_mutex_unlock(&fps_state.lock);
+                len = buf + len - start;
+                memmove(buf, start, len);
+                if (len == sizeof buf - 1) len = 0;  // an absurdly long line; drop it
             }
-            fclose(f);
+            close(fd);
         }
         g_usleep(G_USEC_PER_SEC);
     }
     return NULL;
 }
 
-// GPU utilisation from DRM fdinfo (drm-engine-gpu busy ns per client). Many fds
-// share one DRM client, so after each rescan we keep a single fdinfo path per
-// client and read only those each second.
-typedef struct { long long id; char path[576]; long long ns, prev; } GpuClient;
+// GPU utilisation from DRM fdinfo (drm-engine-gpu busy ns per client). On msm
+// each fdinfo read costs ~0.3 ms of kernel time, so we read as few as we can:
+// - many fds share one DRM client, and we keep one fdinfo path per client;
+// - fd -> client ids are remembered across rescans, so a rescan (every 10 s)
+//   only reads fds it hasn't seen before;
+// - processes with no GPU fds are skipped by rescans (rechecked every 60 s),
+//   since readlink-ing every fd of every process is the expensive part;
+// - each second we only read clients that were busy in the last 10 s. An idle
+//   client that wakes up is caught at the next rescan, which reads them all.
+typedef struct { long long id; char path[576]; long long prev; gint64 last_active; } GpuClient;
 
 static struct {
     GpuClient clients[MAX_CLIENTS];
     int n;
     gint64 last_scan, prev_t;
+    GHashTable *ids;  // fdinfo path -> client id
+    GHashTable *no_gpu;  // pid -> when it was last seen without GPU fds
 } gpu;
 
 static gboolean parse_fdinfo(const char *path, long long *id, long long *ns) {
@@ -277,7 +293,11 @@ static gboolean parse_fdinfo(const char *path, long long *id, long long *ns) {
     return TRUE;
 }
 
-static void gpu_scan(void) {
+static void gpu_scan(gint64 now) {
+    if (!gpu.ids) gpu.ids = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    if (!gpu.no_gpu) gpu.no_gpu = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
+    GHashTable *live = g_hash_table_new(g_direct_hash, g_direct_equal);
+    GHashTable *seen_paths = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
     GpuClient old[MAX_CLIENTS];
     int old_n = gpu.n;
     memcpy(old, gpu.clients, sizeof(GpuClient) * old_n);
@@ -286,44 +306,85 @@ static void gpu_scan(void) {
     struct dirent *e;
     while (d && (e = readdir(d))) {
         if (!is_pid(e->d_name)) continue;
+        gpointer pid = GINT_TO_POINTER(atoi(e->d_name));
+        g_hash_table_add(live, pid);
+        gint64 *checked = g_hash_table_lookup(gpu.no_gpu, pid);
+        if (checked && now - *checked < 60 * G_USEC_PER_SEC) continue;
         char dir[288];
         snprintf(dir, sizeof dir, "/proc/%s/fd", e->d_name);
         DIR *fds = opendir(dir);
         struct dirent *f;
+        gboolean has_gpu = FALSE;
         while (fds && (f = readdir(fds))) {
             if (f->d_name[0] == '.') continue;
-            char link[576], target[64];
+            char link[576], target[64], path[576];
             snprintf(link, sizeof link, "%s/%s", dir, f->d_name);
             ssize_t n = readlink(link, target, sizeof target - 1);
             if (n <= 0) continue;
             target[n] = 0;
             if (strncmp(target, "/dev/dri/", 9)) continue;
-            GpuClient c = {0};
-            snprintf(c.path, sizeof c.path, "/proc/%s/fdinfo/%s", e->d_name, f->d_name);
-            if (!parse_fdinfo(c.path, &c.id, &c.ns)) continue;
-            gboolean seen = FALSE;
-            for (int i = 0; i < gpu.n && !seen; i++) seen = gpu.clients[i].id == c.id;
-            if (seen || gpu.n == MAX_CLIENTS) continue;
-            c.prev = -1;
-            for (int i = 0; i < old_n; i++) if (old[i].id == c.id) c.prev = old[i].prev;
+            has_gpu = TRUE;
+            snprintf(path, sizeof path, "/proc/%s/fdinfo/%s", e->d_name, f->d_name);
+            gpointer known;
+            long long id, ns;
+            if (g_hash_table_lookup_extended(gpu.ids, path, NULL, &known)) {
+                id = GPOINTER_TO_SIZE(known);
+            } else {
+                if (!parse_fdinfo(path, &id, &ns)) continue;
+                g_hash_table_insert(gpu.ids, g_strdup(path), GSIZE_TO_POINTER((gsize)id));
+            }
+            g_hash_table_add(seen_paths, g_strdup(path));
+            gboolean dup = FALSE;
+            for (int i = 0; i < gpu.n && !dup; i++) dup = gpu.clients[i].id == id;
+            if (dup || gpu.n == MAX_CLIENTS) continue;
+            GpuClient c = {.id = id, .prev = -1, .last_active = now};
+            g_strlcpy(c.path, path, sizeof c.path);
+            for (int i = 0; i < old_n; i++)
+                if (old[i].id == id) c.prev = old[i].prev, c.last_active = old[i].last_active;
             gpu.clients[gpu.n++] = c;
         }
         if (fds) closedir(fds);
+        if (has_gpu) {
+            g_hash_table_remove(gpu.no_gpu, pid);
+        } else {
+            gint64 *when = g_new(gint64, 1);
+            *when = now;
+            g_hash_table_replace(gpu.no_gpu, pid, when);
+        }
     }
     if (d) closedir(d);
-    gpu.last_scan = g_get_monotonic_time();
+    // Forget processes that exited (pids get reused).
+    GHashTableIter pit;
+    gpointer pkey;
+    g_hash_table_iter_init(&pit, gpu.no_gpu);
+    while (g_hash_table_iter_next(&pit, &pkey, NULL))
+        if (!g_hash_table_contains(live, pkey)) g_hash_table_iter_remove(&pit);
+    g_hash_table_destroy(live);
+    // Forget fds that have gone away (their numbers may be reused for other files).
+    GHashTableIter it;
+    gpointer key;
+    g_hash_table_iter_init(&it, gpu.ids);
+    while (g_hash_table_iter_next(&it, &key, NULL))
+        if (!g_hash_table_contains(seen_paths, key)) g_hash_table_iter_remove(&it);
+    g_hash_table_destroy(seen_paths);
+    gpu.last_scan = now;
 }
 
 // Returns busy % since the last call, or NAN on the first.
 static double gpu_sample(void) {
     gint64 now = g_get_monotonic_time();
-    if (now - gpu.last_scan > GPU_RESCAN * G_USEC_PER_SEC) gpu_scan();
+    gboolean rescan = now - gpu.last_scan > GPU_RESCAN * G_USEC_PER_SEC;
+    if (rescan) gpu_scan(now);
     long long delta = 0;
     for (int i = 0; i < gpu.n; i++) {
         GpuClient *c = &gpu.clients[i];
+        if (!rescan && now - c->last_active > GPU_RESCAN * G_USEC_PER_SEC) continue;
         long long id, ns;
         if (!parse_fdinfo(c->path, &id, &ns) || id != c->id) continue;
-        if (c->prev >= 0 && ns > c->prev) delta += ns - c->prev;
+        if (c->prev >= 0 && ns > c->prev) {
+            delta += ns - c->prev;
+            c->last_active = now;
+        }
         c->prev = ns;
     }
     double pct = NAN;
@@ -406,167 +467,379 @@ static double max_temp(char **zones, int n) {
     return best / 1000.0;
 }
 
+#define BAT "/sys/class/power_supply/battery/"
+#define USB "/sys/class/power_supply/qcom-battmgr-usb/"
+
 static void sample(Sample *s) {
     s->cpu = cpu_percent();
     s->gpu = gpu_sample();
     s->gpu_mhz = sampler.gpu_freq ? (int)(read_ll(sampler.gpu_freq, 0) / 1000000) : 0;
-    char bat[4096], usb[4096];
-    read_uevent("/sys/class/power_supply/battery", bat, sizeof bat);
-    read_uevent("/sys/class/power_supply/qcom-battmgr-usb", usb, sizeof usb);
-    s->bat_pct = (int)uevent_ll(bat, "CAPACITY", 0);
-    uevent_str(bat, "STATUS", s->bat_status, sizeof s->bat_status);
+    // Individual attributes, not uevent: each battmgr read is a firmware round
+    // trip, and uevent asks for every property (~30 ms) where we need a few.
+    // Slow-moving values are re-read every few seconds; the rest every tick.
+    gint64 t = g_get_monotonic_time();
+    static gint64 slow_read, therm_read;
+    static int bat_pct;
+    static long long charge_now;
+    static char status[32];
+    static double cpu_temp, gpu_temp;
+    if (!slow_read || t - slow_read >= 5 * G_USEC_PER_SEC) {
+        bat_pct = (int)read_ll(BAT "capacity", 0);
+        read_file(BAT "status", status, sizeof status);
+        status[strcspn(status, "\n")] = 0;
+        charge_now = read_ll(BAT "charge_now", 0);
+        slow_read = t;
+    }
+    if (!therm_read || t - therm_read >= 2 * G_USEC_PER_SEC) {
+        cpu_temp = max_temp(sampler.cpu_zones, sampler.n_cpu_zones);
+        gpu_temp = max_temp(sampler.gpu_zones, sampler.n_gpu_zones);
+        therm_read = t;
+    }
+    s->bat_pct = bat_pct;
+    g_strlcpy(s->bat_status, status, sizeof s->bat_status);
+    s->cpu_temp = cpu_temp;
+    s->gpu_temp = gpu_temp;
     // POWER_NOW on the Thor's battmgr is stale/garbage (~43 W at a real ~9 W); use V×I.
-    long long cur = uevent_ll(bat, "CURRENT_NOW", 0);
-    s->bat_w = fabs((double)uevent_ll(bat, "VOLTAGE_NOW", 0) * cur) / 1e12;
-    s->usb_w = uevent_ll(usb, "ONLINE", 0) == 1
-                   ? (double)uevent_ll(usb, "VOLTAGE_NOW", 0) * uevent_ll(usb, "CURRENT_NOW", 0) / 1e12 : 0;
+    long long cur = read_ll(BAT "current_now", 0);
+    s->bat_w = fabs((double)read_ll(BAT "voltage_now", 0) * cur) / 1e12;
+    s->usb_w = read_ll(USB "online", 0) == 1
+                   ? (double)read_ll(USB "voltage_now", 0) * read_ll(USB "current_now", 0) / 1e12 : 0;
     cur = llabs(cur);
-    long long now = uevent_ll(bat, "CHARGE_NOW", 0), full = uevent_ll(bat, "CHARGE_FULL", 0);
+    static long long full;
+    static gint64 full_read;
+    if (!full || t - full_read > 60 * G_USEC_PER_SEC) {  // barely changes
+        full = read_ll(BAT "charge_full", 0);
+        full_read = t;
+    }
+    long long now = charge_now;
     s->bat_eta = NAN;
     if (cur > 50000) {
         if (!strcmp(s->bat_status, "Discharging")) s->bat_eta = (double)now / cur;
         else if (!strcmp(s->bat_status, "Charging") && full > now) s->bat_eta = (double)(full - now) / cur;
     }
-    s->cpu_temp = max_temp(sampler.cpu_zones, sampler.n_cpu_zones);
-    s->gpu_temp = max_temp(sampler.gpu_zones, sampler.n_gpu_zones);
-    s->bat_temp = uevent_ll(bat, "TEMP", 0) / 10.0;
     s->fan_rpm = sampler.fan ? (int)read_ll(sampler.fan, -1) : -1;
+    s->bat_temp = s->fan_rpm < 0 ? read_ll(BAT "temp", 0) / 10.0 : NAN;  // only shown without a fan
     char mem[4096];
     read_file("/proc/meminfo", mem, sizeof mem);
-    const char *t = strstr(mem, "MemTotal:"), *a = strstr(mem, "MemAvailable:");
-    double total = t ? strtod(t + 9, NULL) : 1, avail = a ? strtod(a + 13, NULL) : 0;
+    const char *mt = strstr(mem, "MemTotal:"), *ma = strstr(mem, "MemAvailable:");
+    double total = mt ? strtod(mt + 9, NULL) : 1, avail = ma ? strtod(ma + 13, NULL) : 0;
     s->mem_used = (total - avail) / 1048576;
     s->mem_total = total / 1048576;
 }
 
-// ---------------------------------------------------------------- drawing
+// ---------------------------------------------------------------- raster
 //
-// Everything is drawn as GTK render nodes (paths, strokes, text layouts), so
-// GTK's GPU renderer does the rasterising instead of Cairo filling a software
-// image for every widget each second.
+// Everything is drawn by hand into an XRGB8888 canvas at the panel's buffer
+// scale: antialiased coverage from distance fields for arcs, segments and
+// rounded boxes, and FreeType glyphs rasterised once and cached. Only regions
+// whose content changed are redrawn and sent to the compositor.
 
-typedef void (*DrawFn)(GtkWidget *w, GtkSnapshot *s, double width, double height, gpointer data);
+typedef struct { double x, y, w, h; } Rect;  // logical pixels
+typedef struct { int x0, y0, x1, y1; } IRect;  // device pixels, half-open
 
-#define HUD_TYPE_CANVAS (hud_canvas_get_type())
-G_DECLARE_FINAL_TYPE(HudCanvas, hud_canvas, HUD, CANVAS, GtkWidget)
+static struct {
+    uint32_t *px;
+    int w, h;  // device pixels; stride is w
+} canvas;
+static int S = 1;  // buffer scale: device pixels per logical pixel
+static IRect clip;  // all drawing is limited to this
 
-struct _HudCanvas {
-    GtkWidget parent;
-    DrawFn draw;
-    gpointer data;
-};
-
-G_DEFINE_TYPE(HudCanvas, hud_canvas, GTK_TYPE_WIDGET)
-
-static void hud_canvas_snapshot(GtkWidget *w, GtkSnapshot *s) {
-    HudCanvas *c = HUD_CANVAS(w);
-    c->draw(w, s, gtk_widget_get_width(w), gtk_widget_get_height(w), c->data);
+static IRect to_device(Rect r) {
+    return (IRect){(int)lround(r.x * S), (int)lround(r.y * S), (int)lround((r.x + r.w) * S),
+                   (int)lround((r.y + r.h) * S)};
 }
 
-static void hud_canvas_class_init(HudCanvasClass *klass) { GTK_WIDGET_CLASS(klass)->snapshot = hud_canvas_snapshot; }
-static void hud_canvas_init(HudCanvas *c) { (void)c; }
-
-static GtkWidget *canvas_new(DrawFn draw, gpointer data) {
-    HudCanvas *c = g_object_new(HUD_TYPE_CANVAS, NULL);
-    c->draw = draw;
-    c->data = data;
-    gtk_widget_set_hexpand(GTK_WIDGET(c), TRUE);
-    gtk_widget_set_vexpand(GTK_WIDGET(c), TRUE);
-    return GTK_WIDGET(c);
+static IRect intersect(IRect a, IRect b) {
+    return (IRect){MAX(a.x0, b.x0), MAX(a.y0, b.y0), MIN(a.x1, b.x1), MIN(a.y1, b.y1)};
 }
 
-static GdkRGBA rgba(Color c, double a) { return (GdkRGBA){c.r, c.g, c.b, a}; }
-
-// Strokes and frees path.
-static void stroke(GtkSnapshot *s, GskPath *path, double width, GskLineCap cap, Color c, double a) {
-    GskStroke *st = gsk_stroke_new(width);
-    gsk_stroke_set_line_cap(st, cap);
-    GdkRGBA col = rgba(c, a);
-    gtk_snapshot_append_stroke(s, path, st, &col);
-    gsk_stroke_free(st);
-    gsk_path_unref(path);
+static uint32_t pack(Color c) {
+    return (uint32_t)lround(c.r * 255) << 16 | (uint32_t)lround(c.g * 255) << 8 | (uint32_t)lround(c.b * 255);
 }
 
-// Arc of radius r around (cx, cy) from angle a0 to a1 (radians, clockwise on screen).
-static GskPath *arc_path(double cx, double cy, double r, double a0, double a1) {
-    GskPathBuilder *b = gsk_path_builder_new();
-    if (a1 - a0 >= 2 * G_PI - 1e-6) {
-        gsk_path_builder_add_circle(b, &GRAPHENE_POINT_INIT(cx, cy), r);
-    } else {
-        gsk_path_builder_move_to(b, cx + r * cos(a0), cy + r * sin(a0));
-        gsk_path_builder_svg_arc_to(b, r, r, 0, a1 - a0 > G_PI, TRUE, cx + r * cos(a1), cy + r * sin(a1));
+// Blends packed colour src over *p with coverage a in [0, 1].
+static inline void blend(uint32_t *p, uint32_t src, float a) {
+    if (a <= 0) return;
+    int k = (int)(a * 256 + 0.5f);
+    if (k >= 256) { *p = src; return; }
+    uint32_t d = *p;
+    // Red and blue share one multiply (they're 16 bits apart), green gets another.
+    uint32_t rb = ((src & 0xff00ff) * k + (d & 0xff00ff) * (256 - k)) >> 8 & 0xff00ff;
+    uint32_t g = ((src & 0xff00) * k + (d & 0xff00) * (256 - k)) >> 8 & 0xff00;
+    *p = rb | g;
+}
+
+static void clear(IRect r) {
+    r = intersect(r, (IRect){0, 0, canvas.w, canvas.h});
+    for (int y = r.y0; y < r.y1; y++) memset(canvas.px + y * canvas.w + r.x0, 0, (r.x1 - r.x0) * 4);
+}
+
+static void fill_rect(Rect lr, Color c, float alpha) {
+    IRect r = intersect(to_device(lr), clip);
+    uint32_t sc = pack(c);
+    for (int y = r.y0; y < r.y1; y++)
+        for (int x = r.x0; x < r.x1; x++) blend(canvas.px + y * canvas.w + x, sc, alpha);
+}
+
+static float coverage(double d) { return (float)CLAMP(0.5 - d, 0.0, 1.0); }  // d: signed distance
+
+// Arc of radius r (centre line) and width lw from angle a0 to a1 (radians,
+// clockwise on screen) with round caps. Only pixels in the ring's band are
+// visited, and the in-sweep test is two cross products against the end
+// directions, so per pixel it's one sqrt (plus one more near the caps).
+static void stroke_arc(double cx, double cy, double r, double lw, double a0, double a1, Color c, float alpha) {
+    cx *= S, cy *= S, r *= S, lw *= S;
+    double hw = lw / 2, outer = r + hw + 1, inner = MAX(0.0, r - hw - 1), sweep = a1 - a0;
+    gboolean full = sweep >= 2 * G_PI - 1e-6, wide = sweep > G_PI;
+    double u0x = cos(a0), u0y = sin(a0), u1x = cos(a1), u1y = sin(a1);
+    double p0x = r * u0x, p0y = r * u0y, p1x = r * u1x, p1y = r * u1y;  // cap centres, relative to (cx, cy)
+    uint32_t sc = pack(c);
+    int y0 = MAX(clip.y0, (int)floor(cy - outer)), y1 = MIN(clip.y1, (int)ceil(cy + outer));
+    for (int y = y0; y < y1; y++) {
+        double dy = y + 0.5 - cy;
+        if (dy * dy >= outer * outer) continue;
+        double xo = sqrt(outer * outer - dy * dy), xi = dy * dy < inner * inner ? sqrt(inner * inner - dy * dy) : 0;
+        // The row crosses the band in two spans, either side of the ring's hole
+        // (which may be empty); the second starts where the first ended at the latest.
+        int left_end = (int)ceil(cx - xi);
+        int spans[2][2] = {{(int)floor(cx - xo), left_end}, {MAX(left_end, (int)floor(cx + xi)), (int)ceil(cx + xo)}};
+        for (int k = 0; k < 2; k++) {
+            int xa = MAX(clip.x0, spans[k][0]), xb = MIN(clip.x1, spans[k][1]);
+            for (int x = xa; x < xb; x++) {
+                double dx = x + 0.5 - cx, dist;
+                // p is clockwise of u when u × p > 0 (y points down).
+                double c0 = u0x * dy - u0y * dx, c1 = dx * u1y - dy * u1x;
+                gboolean inside = full || (wide ? !(c0 < 0 && c1 < 0) : (c0 >= 0 && c1 >= 0));
+                if (inside) {
+                    dist = fabs(sqrt(dx * dx + dy * dy) - r);
+                } else {
+                    double e0 = (dx - p0x) * (dx - p0x) + (dy - p0y) * (dy - p0y);
+                    double e1 = (dx - p1x) * (dx - p1x) + (dy - p1y) * (dy - p1y);
+                    dist = sqrt(MIN(e0, e1));
+                }
+                blend(canvas.px + y * canvas.w + x, sc, coverage(dist - hw) * alpha);
+            }
+        }
     }
-    return gsk_path_builder_free_to_path(b);
 }
 
-static GskPath *line_path(double x0, double y0, double x1, double y1) {
-    GskPathBuilder *b = gsk_path_builder_new();
-    gsk_path_builder_move_to(b, x0, y0);
-    gsk_path_builder_line_to(b, x1, y1);
-    return gsk_path_builder_free_to_path(b);
+// Straight segment of width lw with round caps (a capsule).
+static void stroke_segment(double ax, double ay, double bx, double by, double lw, Color c, float alpha) {
+    ax *= S, ay *= S, bx *= S, by *= S, lw *= S;
+    double hw = lw / 2, vx = bx - ax, vy = by - ay, len2 = vx * vx + vy * vy;
+    uint32_t sc = pack(c);
+    IRect r = intersect((IRect){(int)floor(MIN(ax, bx) - hw - 1), (int)floor(MIN(ay, by) - hw - 1),
+                                (int)ceil(MAX(ax, bx) + hw + 1), (int)ceil(MAX(ay, by) + hw + 1)}, clip);
+    for (int y = r.y0; y < r.y1; y++)
+        for (int x = r.x0; x < r.x1; x++) {
+            double px = x + 0.5 - ax, py = y + 0.5 - ay;
+            double t = len2 > 0 ? CLAMP((px * vx + py * vy) / len2, 0.0, 1.0) : 0;
+            double dx = px - vx * t, dy = py - vy * t;
+            blend(canvas.px + y * canvas.w + x, sc, coverage(sqrt(dx * dx + dy * dy) - hw) * alpha);
+        }
+}
+
+// Signed distance from (px, py) to a box with per-corner radii (tl, tr, br, bl).
+static double sd_round_box(double px, double py, IRect b, const double radii[4]) {
+    double cx = (b.x0 + b.x1) / 2.0, cy = (b.y0 + b.y1) / 2.0, hx = (b.x1 - b.x0) / 2.0, hy = (b.y1 - b.y0) / 2.0;
+    double r = px < cx ? (py < cy ? radii[0] : radii[3]) : (py < cy ? radii[1] : radii[2]);
+    double qx = fabs(px - cx) - (hx - r), qy = fabs(py - cy) - (hy - r);
+    double ox = MAX(qx, 0.0), oy = MAX(qy, 0.0);
+    return sqrt(ox * ox + oy * oy) + MIN(MAX(qx, qy), 0.0) - r;
+}
+
+// Fills a rounded box, or with border > 0 strokes just its inner border.
+static void round_box(Rect lr, const double lradii[4], double border, Color c, float alpha) {
+    IRect b = to_device(lr), r = intersect(b, clip);
+    double radii[4] = {lradii[0] * S, lradii[1] * S, lradii[2] * S, lradii[3] * S}, bw = border * S;
+    uint32_t sc = pack(c);
+    for (int y = r.y0; y < r.y1; y++)
+        for (int x = r.x0; x < r.x1; x++) {
+            double sd = sd_round_box(x + 0.5, y + 0.5, b, radii);
+            float a = coverage(sd);
+            if (bw > 0) a -= coverage(sd + bw);
+            blend(canvas.px + y * canvas.w + x, sc, a * alpha);
+        }
+}
+
+// ---------------------------------------------------------------- text
+//
+// Glyphs are rasterised once per (font, pixel size, character) with FreeType
+// and kept; laying out a string is just summing advances. Noto Sans digits are
+// tabular, so numbers don't jitter.
+
+typedef struct {
+    int w, h, left, top;
+    float advance;  // device pixels
+    uint8_t *bits;
+} Glyph;
+
+static FT_Library ft;
+static FT_Face faces[2];  // regular, bold
+static int face_px[2];
+static GHashTable *glyphs;
+
+static FT_Face load_face(const char *pattern) {
+    FcPattern *pat = FcNameParse((const FcChar8 *)pattern);
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+    FcResult res;
+    FcPattern *match = FcFontMatch(NULL, pat, &res);
+    FcChar8 *file = NULL;
+    int index = 0;
+    FT_Face face = NULL;
+    if (match && FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch) {
+        FcPatternGetInteger(match, FC_INDEX, 0, &index);
+        if (FT_New_Face(ft, (const char *)file, index, &face)) face = NULL;
+    }
+    if (match) FcPatternDestroy(match);
+    FcPatternDestroy(pat);
+    if (!face) g_error("thor-hud: no font for %s", pattern);
+    return face;
+}
+
+static void fonts_init(void) {
+    FcInit();
+    if (FT_Init_FreeType(&ft)) g_error("thor-hud: FreeType init failed");
+    faces[0] = load_face("Noto Sans:weight=80");
+    faces[1] = load_face("Noto Sans:weight=200");
+    glyphs = g_hash_table_new(g_int64_hash, g_int64_equal);
+}
+
+static FT_Face sized(int bold, int px) {
+    if (face_px[bold] != px) {
+        FT_Set_Pixel_Sizes(faces[bold], 0, px);
+        face_px[bold] = px;
+    }
+    return faces[bold];
+}
+
+static const Glyph *glyph(int bold, int px, gunichar ch) {
+    gint64 key = (gint64)bold << 40 | (gint64)px << 24 | ch;
+    Glyph *g = g_hash_table_lookup(glyphs, &key);
+    if (g) return g;
+    g = g_new0(Glyph, 1);
+    FT_Face face = sized(bold, px);
+    FT_UInt index = FT_Get_Char_Index(face, ch);
+    if (!FT_Load_Glyph(face, index, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT)) {
+        FT_Bitmap *bm = &face->glyph->bitmap;
+        g->w = bm->width;
+        g->h = bm->rows;
+        g->left = face->glyph->bitmap_left;
+        g->top = face->glyph->bitmap_top;
+        g->advance = face->glyph->advance.x / 64.0f;
+        g->bits = g_malloc(g->w * g->h + 1);
+        for (int y = 0; y < g->h; y++) memcpy(g->bits + y * g->w, bm->buffer + y * bm->pitch, g->w);
+    }
+    gint64 *k = g_new(gint64, 1);
+    *k = key;
+    g_hash_table_insert(glyphs, k, g);
+    return g;
+}
+
+static float measure(int bold, int px, const char *s, const char *end) {
+    float w = 0;
+    for (const char *p = s; p < end && *p; p = g_utf8_next_char(p)) w += glyph(bold, px, g_utf8_get_char(p))->advance;
+    return w;
 }
 
 typedef enum { LEFT, CENTER, RIGHT } Align;
 typedef enum { TOP, MIDDLE, BOTTOM } Anchor;
 
-// Draws str anchored at (x, y); returns its logical width.
-static double text(GtkWidget *w, GtkSnapshot *s, const char *str, double x, double y, double size, Color color,
-                   PangoWeight weight, Align align, Anchor anchor, double max_width) {
-    static PangoAttrList *tnum;
-    if (!tnum) {
-        tnum = pango_attr_list_new();
-        pango_attr_list_insert(tnum, pango_attr_font_features_new("tnum"));
+// Draws s anchored at logical (x, y) like a Pango layout's logical box; returns
+// its logical width. max_width > 0 ellipsizes at the end.
+static double text(const char *s, double x, double y, double size, Color c, int bold, Align align, Anchor anchor,
+                   double max_width) {
+    int px = MAX(1, (int)lround(size * S));
+    FT_Face face = sized(bold, px);
+    float asc = face->size->metrics.ascender / 64.0f, desc = -face->size->metrics.descender / 64.0f;
+    const char *end = s + strlen(s);
+    float w = measure(bold, px, s, end);
+    gboolean ellipsis = FALSE;
+    if (max_width > 0 && w > max_width * S) {
+        float budget = max_width * S - glyph(bold, px, 0x2026)->advance;
+        w = 0;
+        end = s;
+        for (const char *p = s; *p; p = g_utf8_next_char(p)) {
+            float a = glyph(bold, px, g_utf8_get_char(p))->advance;
+            if (w + a > budget) break;
+            w += a;
+            end = g_utf8_next_char(p);
+        }
+        w += glyph(bold, px, 0x2026)->advance;
+        ellipsis = TRUE;
     }
-    PangoLayout *layout = pango_layout_new(gtk_widget_get_pango_context(w));
-    PangoFontDescription *desc = pango_font_description_new();
-    pango_font_description_set_family_static(desc, "Noto Sans");
-    pango_font_description_set_weight(desc, weight);
-    pango_font_description_set_absolute_size(desc, size * PANGO_SCALE);
-    pango_layout_set_font_description(layout, desc);
-    pango_font_description_free(desc);
-    pango_layout_set_attributes(layout, tnum);
-    if (max_width > 0) {
-        pango_layout_set_width(layout, (int)(max_width * PANGO_SCALE));
-        pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+    float pen = x * S - (align == CENTER ? w / 2 : align == RIGHT ? w : 0);
+    float top = y * S - (anchor == MIDDLE ? (asc + desc) / 2 : anchor == BOTTOM ? asc + desc : 0);
+    int baseline = (int)lroundf(top + asc);
+    uint32_t sc = pack(c);
+    for (const char *p = s;; p = g_utf8_next_char(p)) {
+        gunichar ch;
+        if (p < end && *p) ch = g_utf8_get_char(p);
+        else if (ellipsis) ch = 0x2026, ellipsis = FALSE, p = end;
+        else break;
+        const Glyph *g = glyph(bold, px, ch);
+        int gx = (int)lroundf(pen) + g->left, gy = baseline - g->top;
+        IRect r = intersect((IRect){gx, gy, gx + g->w, gy + g->h}, clip);
+        for (int yy = r.y0; yy < r.y1; yy++)
+            for (int xx = r.x0; xx < r.x1; xx++) {
+                uint8_t cov = g->bits[(yy - gy) * g->w + (xx - gx)];
+                if (cov) blend(canvas.px + yy * canvas.w + xx, sc, cov / 255.0f);
+            }
+        pen += g->advance;
+        if (p >= end) break;
     }
-    pango_layout_set_text(layout, str, -1);
-    PangoRectangle ext;
-    pango_layout_get_pixel_extents(layout, NULL, &ext);
-    double dx = align == CENTER ? -ext.width / 2.0 - ext.x : align == LEFT ? -ext.x : -ext.width - ext.x;
-    double dy = anchor == MIDDLE ? -ext.height / 2.0 - ext.y : anchor == TOP ? -ext.y : -ext.height - ext.y;
-    GdkRGBA col = rgba(color, 1);
-    gtk_snapshot_save(s);
-    gtk_snapshot_translate(s, &GRAPHENE_POINT_INIT(x + dx, y + dy));
-    gtk_snapshot_append_layout(s, layout, &col);
-    gtk_snapshot_restore(s);
-    g_object_unref(layout);
-    return ext.width;
+    return w / S;
 }
+
+// ---------------------------------------------------------------- widgets
+
+// A screen area that is redrawn as a whole when marked dirty. Its static part
+// (draw_static, optional) is drawn once per layout and then restored from a
+// saved copy; draw adds what changes.
+typedef struct Region {
+    Rect r;
+    gboolean dirty;
+    void (*draw_static)(struct Region *self);
+    void (*draw)(struct Region *self);
+    void *data;
+    uint32_t *base;  // saved static pixels, NULL until drawn at the current layout
+} Region;
 
 // 270° arc meter with a big centre value and a small caption.
 typedef struct {
-    GtkWidget *area;
+    Region region;
     const char *label;
     Color color, arc_color, value_color;
     double minimum, maximum, value;  // value NAN when none
     char display[32], sub[64];
 } Gauge;
 
-static void gauge_draw(GtkWidget *w, GtkSnapshot *s, double width, double height, gpointer data) {
-    Gauge *g = data;
-    double r = MIN(width, height * 1.02) / 2 - 6;
-    double cx = width / 2, cy = height / 2 + r * 0.08;
-    double lw = MAX(4.0, r * 0.13);
-    double start = 135 * G_PI / 180, sweep = 270 * G_PI / 180;
-    stroke(s, arc_path(cx, cy, r - lw / 2, start, start + sweep), lw, GSK_LINE_CAP_ROUND, TRACK, 1);
+typedef struct { double r, cx, cy, lw, start, sweep; } GaugeGeometry;
+
+static GaugeGeometry gauge_geometry(Rect a) {
+    double r = MIN(a.w, a.h * 1.02) / 2 - 6;
+    return (GaugeGeometry){r, a.x + a.w / 2, a.y + a.h / 2 + r * 0.08, MAX(4.0, r * 0.13), 135 * G_PI / 180,
+                           270 * G_PI / 180};
+}
+
+static void gauge_draw_static(Region *reg) {
+    Gauge *g = reg->data;
+    GaugeGeometry k = gauge_geometry(reg->r);
+    stroke_arc(k.cx, k.cy, k.r - k.lw / 2, k.lw, k.start, k.start + k.sweep, TRACK, 1);
+    text(g->label, k.cx, k.cy + k.r * 0.42, k.r * 0.19, DIM, 1, CENTER, MIDDLE, 0);
+}
+
+static void gauge_draw(Region *reg) {
+    Gauge *g = reg->data;
+    GaugeGeometry k = gauge_geometry(reg->r);
+    double r = k.r, cx = k.cx, cy = k.cy, lw = k.lw, start = k.start, sweep = k.sweep;
     if (!isnan(g->value)) {
         double frac = CLAMP((g->value - g->minimum) / (g->maximum - g->minimum), 0.0, 1.0);
-        if (frac > 0.005)
-            stroke(s, arc_path(cx, cy, r - lw / 2, start, start + sweep * frac), lw, GSK_LINE_CAP_ROUND, g->arc_color, 1);
+        if (frac > 0.005) stroke_arc(cx, cy, r - lw / 2, lw, start, start + sweep * frac, g->arc_color, 1);
     }
-    text(w, s, g->display, cx, cy - r * 0.04, r * 0.48, g->value_color, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
-    text(w, s, g->label, cx, cy + r * 0.42, r * 0.19, DIM, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
-    if (*g->sub) text(w, s, g->sub, cx, cy + r * 0.82, r * 0.18, DIM, PANGO_WEIGHT_NORMAL, CENTER, MIDDLE, 0);
+    text(g->display, cx, cy - r * 0.04, r * 0.48, g->value_color, 1, CENTER, MIDDLE, 0);
+    if (*g->sub) text(g->sub, cx, cy + r * 0.82, r * 0.18, DIM, 0, CENTER, MIDDLE, 0);
 }
 
 static Gauge *gauge_new(const char *label, Color color, double maximum, double minimum) {
@@ -578,14 +851,14 @@ static Gauge *gauge_new(const char *label, Color color, double maximum, double m
     g->maximum = maximum;
     g->value = NAN;
     g_strlcpy(g->display, "–", sizeof g->display);
-    g->area = canvas_new(gauge_draw, g);
+    g->region = (Region){.draw_static = gauge_draw_static, .draw = gauge_draw, .data = g, .dirty = TRUE};
     return g;
 }
 
 static gboolean same_color(Color a, Color b) { return a.r == b.r && a.g == b.g && a.b == b.b; }
 
-// arc_color / value_color: NULL means the gauge's own colour / TEXT. Only
-// redraws when something visible changed.
+// arc_color / value_color: NULL means the gauge's own colour / TEXT. Only marks
+// the gauge dirty when something visible changed.
 static void gauge_update(Gauge *g, double value, const char *display, const char *sub,
                          const Color *arc_color, const Color *value_color) {
     Color arc = arc_color ? *arc_color : g->color, val = value_color ? *value_color : TEXT;
@@ -598,12 +871,12 @@ static void gauge_update(Gauge *g, double value, const char *display, const char
     g_strlcpy(g->sub, sub, sizeof g->sub);
     g->arc_color = arc;
     g->value_color = val;
-    gtk_widget_queue_draw(g->area);
+    g->region.dirty = TRUE;
 }
 
 // FPS readout, focused game, battery, and a scrolling FPS history graph.
 static struct {
-    GtkWidget *area;
+    Region region;
     double history[HISTORY];  // NAN where the readout is blank; the graph gaps there
     int count;
     double fps;
@@ -614,22 +887,31 @@ static struct {
 } panel = {.fps = NAN, .battery = -1};
 
 static void panel_push(double fps, const char *focus) {
+    gboolean blank = isnan(fps) && isnan(panel.fps) && !strcmp(focus, panel.focus);
+    for (int i = 0; blank && i < panel.count; i++) blank = isnan(panel.history[i]);
     panel.fps = fps;
     g_strlcpy(panel.focus, focus, sizeof panel.focus);
     if (panel.count == HISTORY) memmove(panel.history, panel.history + 1, sizeof(double) * (HISTORY - 1));
     else panel.count++;
     panel.history[panel.count - 1] = fps;
-    gtk_widget_queue_draw(panel.area);
+    if (!blank) panel.region.dirty = TRUE;  // an all-blank graph scrolling looks the same
 }
 
-static void panel_draw(GtkWidget *w, GtkSnapshot *s, double width, double height, gpointer data) {
-    (void)data;
-    double pad = 10, top = panel.max_hz;  // fixed scale: 0 to the display's top refresh rate
-    double gx = pad, gw = width - 2 * pad;
-    double big = MIN(height * 0.34, 44);
-    double gy = pad + big * 1.4 + 6;  // graph starts below the readout's line box
-    double gh = height - gy - pad;
+typedef struct { double pad, top, gx, gw, big, gy, gh; } PanelGeometry;
 
+static PanelGeometry panel_geometry(Rect a) {
+    PanelGeometry k = {.pad = 10, .top = panel.max_hz};  // fixed scale: 0 to the display's top refresh rate
+    k.gx = a.x + k.pad;
+    k.gw = a.w - 2 * k.pad;
+    k.big = MIN(a.h * 0.34, 44);
+    k.gy = a.y + k.pad + k.big * 1.4 + 6;  // graph starts below the readout's line box
+    k.gh = a.y + a.h - k.gy - k.pad;
+    return k;
+}
+
+static void panel_draw_static(Region *reg) {
+    PanelGeometry k = panel_geometry(reg->r);
+    double top = k.top, gx = k.gx, gw = k.gw, gy = k.gy, gh = k.gh;
     // Reference lines at the key frame rates, labelled on the left.
     int refs[G_N_ELEMENTS(reference_fps) + 1], n_refs = 0;
     for (size_t i = 0; i < G_N_ELEMENTS(reference_fps); i++)
@@ -637,62 +919,116 @@ static void panel_draw(GtkWidget *w, GtkSnapshot *s, double width, double height
     refs[n_refs++] = (int)top;
     for (int i = 0; i < n_refs; i++) {
         double y = gy + gh - gh * refs[i] / top;
-        stroke(s, line_path(gx, y, gx + gw, y), 1, GSK_LINE_CAP_BUTT, TRACK, 0.7);
+        fill_rect((Rect){gx, y - 0.5, gw, 1}, TRACK, 0.7f);
         char label[16];
         snprintf(label, sizeof label, "%d", refs[i]);
-        text(w, s, label, gx, y - 2, 10, DIM, PANGO_WEIGHT_NORMAL, LEFT, BOTTOM, 0);
+        text(label, gx, y - 2, 10, DIM, 0, LEFT, BOTTOM, 0);
     }
+}
 
-    // History, as one filled line per contiguous stretch of readings.
+static void panel_draw(Region *reg) {
+    Rect a = reg->r;
+    PanelGeometry k = panel_geometry(a);
+    double pad = k.pad, top = k.top, gx = k.gx, gw = k.gw, big = k.big, gy = k.gy, gh = k.gh;
+
+    // History: a faint fill under each contiguous stretch of readings, then its line.
     double step = gw / (HISTORY - 1), x0 = gx + gw - step * (panel.count - 1);
-    for (int i = 0; i < panel.count;) {
-        if (isnan(panel.history[i])) { i++; continue; }
-        int j = i;
-        while (j < panel.count && !isnan(panel.history[j])) j++;
-        if (j - i >= 2) {
-            GskPathBuilder *area = gsk_path_builder_new(), *line = gsk_path_builder_new();
-            gsk_path_builder_move_to(area, x0 + i * step, gy + gh);
-            for (int k = i; k < j; k++) {
-                double x = x0 + k * step, y = gy + gh - gh * MIN(panel.history[k], top) / top;
-                gsk_path_builder_line_to(area, x, y);
-                if (k == i) gsk_path_builder_move_to(line, x, y);
-                else gsk_path_builder_line_to(line, x, y);
-            }
-            gsk_path_builder_line_to(area, x0 + (j - 1) * step, gy + gh);
-            gsk_path_builder_close(area);
-            GskPath *fill = gsk_path_builder_free_to_path(area);
-            GdkRGBA col = rgba(NEUTRAL, 0.08);
-            gtk_snapshot_append_fill(s, fill, GSK_FILL_RULE_WINDING, &col);
-            gsk_path_unref(fill);
-            stroke(s, gsk_path_builder_free_to_path(line), 1.5, GSK_LINE_CAP_BUTT, NEUTRAL, 1);
+    uint32_t fill = pack(NEUTRAL);
+#define HY(i) (gy + gh - gh * MIN(panel.history[i], top) / top)
+    for (int i = 0; i + 1 < panel.count; i++) {
+        if (isnan(panel.history[i]) || isnan(panel.history[i + 1])) continue;
+        int xa = (int)lround((x0 + i * step) * S), xb = (int)lround((x0 + (i + 1) * step) * S);
+        double ya = HY(i) * S, yb = HY(i + 1) * S, bottom = (gy + gh) * S;
+        for (int x = MAX(xa, clip.x0); x < MIN(xb, clip.x1); x++) {
+            double yt = ya + (yb - ya) * (x + 0.5 - xa) / MAX(1, xb - xa);
+            for (int y = MAX(clip.y0, (int)floor(yt)); y < MIN(clip.y1, (int)lround(bottom)); y++)
+                blend(canvas.px + y * canvas.w + x, fill, 0.08f * (float)CLAMP(y + 1 - yt, 0.0, 1.0));
         }
-        i = j;
     }
+    for (int i = 0; i + 1 < panel.count; i++) {
+        if (isnan(panel.history[i]) || isnan(panel.history[i + 1])) continue;
+        stroke_segment(x0 + i * step, HY(i), x0 + (i + 1) * step, HY(i + 1), 1.5, NEUTRAL, 1);
+    }
+#undef HY
 
     if (!isnan(panel.fps)) {  // blank when gamescope has nothing recent
         char fps[16];
         snprintf(fps, sizeof fps, "%.0f", panel.fps);
-        double uw = text(w, s, "FPS", width - pad, pad + big * 0.9, big * 0.36, DIM, PANGO_WEIGHT_BOLD, RIGHT, BOTTOM, 0);
-        text(w, s, fps, width - pad - uw - 6, pad, big, TEXT, PANGO_WEIGHT_BOLD, RIGHT, TOP, 0);
+        double uw = text("FPS", a.x + a.w - pad, a.y + pad + big * 0.9, big * 0.36, DIM, 1, RIGHT, BOTTOM, 0);
+        text(fps, a.x + a.w - pad - uw - 6, a.y + pad, big, TEXT, 1, RIGHT, TOP, 0);
     }
-    double mid = pad + big * 0.6;
-    if (*panel.focus)
-        text(w, s, app_name(panel.focus), width / 2, mid, big * 0.36, TEXT, PANGO_WEIGHT_NORMAL, CENTER, MIDDLE,
-             width * 0.45);
+    double mid = a.y + pad + big * 0.6;
+    if (*panel.focus) text(app_name(panel.focus), a.x + a.w / 2, mid, big * 0.36, TEXT, 0, CENTER, MIDDLE, a.w * 0.45);
     if (panel.battery >= 0) {
         // Small ring meter around the percentage.
-        double r = big * 0.58, cx = pad + r, lw = 3.5;
-        stroke(s, arc_path(cx, mid, r - lw / 2, 0, 2 * G_PI), lw, GSK_LINE_CAP_ROUND, TRACK, 1);
+        double r = big * 0.58, cx = a.x + pad + r, lw = 3.5;
+        stroke_arc(cx, mid, r - lw / 2, lw, 0, 2 * G_PI, TRACK, 1);
         if (panel.battery > 0) {
             double start = -G_PI / 2;
-            stroke(s, arc_path(cx, mid, r - lw / 2, start, start + 2 * G_PI * MIN(panel.battery, 100) / 100), lw,
-                   GSK_LINE_CAP_ROUND, battery_color(panel.battery), 1);
+            stroke_arc(cx, mid, r - lw / 2, lw, start, start + 2 * G_PI * MIN(panel.battery, 100) / 100,
+                       battery_color(panel.battery), 1);
         }
         char pct[16];
         snprintf(pct, sizeof pct, "%d%%", panel.battery);
-        text(w, s, pct, cx, mid, big * 0.3, TEXT, PANGO_WEIGHT_BOLD, CENTER, MIDDLE, 0);
-        text(w, s, panel.battery_sub, pad + 2 * r + 8, mid, big * 0.3, DIM, PANGO_WEIGHT_NORMAL, LEFT, MIDDLE, 0);
+        text(pct, cx, mid, big * 0.3, TEXT, 1, CENTER, MIDDLE, 0);
+        text(panel.battery_sub, a.x + pad + 2 * r + 8, mid, big * 0.3, DIM, 0, LEFT, MIDDLE, 0);
     }
+}
+
+// A row of toggle buttons; exactly one is selected (or none, if the state
+// came from elsewhere and matches no button).
+typedef struct {
+    Region region;
+    int n, selected;
+    char *values[4], *labels[4];
+    void (*pick)(const char *value);
+} Segmented;
+
+#define BORDER HEX(0x262a2f)
+#define CHECKED HEX(0x262b31)
+
+static void seg_draw(Region *reg) {
+    Segmented *s = reg->data;
+    Rect r = reg->r;
+    double bw = r.w / s->n, radius = 10;
+    for (int i = 0; i < s->n; i++) {
+        Rect b = {r.x + i * bw, r.y, bw, r.h};
+        double radii[4] = {i == 0 ? radius : 0, i == s->n - 1 ? radius : 0, i == s->n - 1 ? radius : 0,
+                           i == 0 ? radius : 0};
+        if (i == s->selected) round_box(b, radii, 0, CHECKED, 1);
+        // Each button draws its top, bottom and right edges; the first also its left.
+        Rect edge = i == 0 ? b : (Rect){b.x - 1, b.y, b.w + 1, b.h};
+        round_box(edge, radii, 1, BORDER, 1);
+        text(s->labels[i], b.x + b.w / 2, b.y + b.h / 2, 13, i == s->selected ? TEXT : DIM, 1, CENTER, MIDDLE, 0);
+    }
+}
+
+static Segmented *seg_new(char **values, char **labels, int n, void (*pick)(const char *)) {
+    Segmented *s = g_new0(Segmented, 1);
+    s->selected = -1;
+    s->pick = pick;
+    for (int i = 0; i < n && i < 4; i++, s->n++) {
+        s->values[i] = g_strdup(values[i]);
+        s->labels[i] = g_strdup(labels[i]);
+    }
+    s->region = (Region){.draw = seg_draw, .data = s, .dirty = TRUE};
+    return s;
+}
+
+static void seg_select(Segmented *s, const char *value) {
+    int sel = -1;
+    for (int i = 0; i < s->n; i++)
+        if (value && !strcmp(value, s->values[i])) sel = i;
+    if (sel != s->selected) {
+        s->selected = sel;
+        s->region.dirty = TRUE;
+    }
+}
+
+static int seg_hit(Segmented *s, double x, double y) {
+    Rect r = s->region.r;
+    if (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h) return -1;
+    return CLAMP((int)((x - r.x) / (r.w / s->n)), 0, s->n - 1);
 }
 
 // ---------------------------------------------------------------- knobs
@@ -735,48 +1071,9 @@ static void power_set(const char *name, GVariant *value) {
                       power_set_done, (gpointer)name);
 }
 
-typedef struct {
-    GtkWidget *box, *buttons[4];
-    char *values[4];
-    int n;
-    gboolean syncing;
-    void (*on_pick)(const char *value);
-} Segmented;
-
-static void seg_toggled(GtkToggleButton *b, gpointer data) {
-    Segmented *s = data;
-    if (!gtk_toggle_button_get_active(b) || s->syncing) return;
-    for (int i = 0; i < s->n; i++)
-        if (GTK_WIDGET(b) == s->buttons[i]) s->on_pick(s->values[i]);
-}
-
-static Segmented *seg_new(char **values, char **labels, int n, void (*on_pick)(const char *)) {
-    Segmented *s = g_new0(Segmented, 1);
-    s->box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_box_set_homogeneous(GTK_BOX(s->box), TRUE);
-    gtk_widget_add_css_class(s->box, "seg");
-    s->on_pick = on_pick;
-    for (int i = 0; i < n && i < 4; i++) {
-        s->values[i] = g_strdup(values[i]);
-        s->buttons[i] = gtk_toggle_button_new_with_label(labels[i]);
-        gtk_widget_set_hexpand(s->buttons[i], TRUE);
-        if (i) gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(s->buttons[i]), GTK_TOGGLE_BUTTON(s->buttons[0]));
-        g_signal_connect(s->buttons[i], "toggled", G_CALLBACK(seg_toggled), s);
-        gtk_box_append(GTK_BOX(s->box), s->buttons[i]);
-        s->n++;
-    }
-    return s;
-}
-
-static void seg_select(Segmented *s, const char *value) {
-    s->syncing = TRUE;
-    for (int i = 0; i < s->n; i++)
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->buttons[i]), value && !strcmp(value, s->values[i]));
-    s->syncing = FALSE;
-}
-
 static Segmented *k_profile, *k_gpu;
 static guint governor_timer;
+static void present(void);
 
 static gboolean apply_governor(gpointer data) {
     (void)data;
@@ -814,6 +1111,7 @@ static gboolean sync_knobs(gpointer data) {
     else seg_select(k_gpu, NULL);  // pinned to some other clock elsewhere
     g_free(profile);
     g_free(level);
+    present();
     return G_SOURCE_REMOVE;
 }
 
@@ -831,24 +1129,366 @@ static void pick_gpu(const char *mode) {
     }
 }
 
-// ---------------------------------------------------------------- app
-
-// True black everywhere for the OLED panel: no section frames or fills, and
-// only the selected knob lights up.
-static const char CSS[] =
-    "window, .root { background: #000; color: #e5e8eb; font-family: \"Noto Sans\"; }\n"
-    ".card { background: #000; padding: 6px; }\n"
-    ".seg button { background: #000; color: #82878c; border: 1px solid #262a2f; border-left-width: 0;\n"
-    "              box-shadow: none; min-height: 34px; padding: 0 6px; font-weight: bold; font-size: 13px;\n"
-    "              border-radius: 0; }\n"
-    ".seg button:first-child { border-left-width: 1px; border-radius: 10px 0 0 10px; }\n"
-    ".seg button:last-child { border-radius: 0 10px 10px 0; }\n"
-    ".seg button:checked { background: #262b31; color: #e5e8eb; }\n"
-    ".knobs { padding: 0 7px 7px 7px; }\n";
+// ---------------------------------------------------------------- layout
 
 static Gauge *g_pwr, *g_cpu, *g_gpu, *g_ram, *g_tmp;
-static gboolean opt_windowed;
-static char *opt_snapshot;
+static Region *regions[8];
+static int n_regions;
+static int win_w = 620, win_h = 540;  // logical
+
+// Same geometry the GTK version had: 8px margins and gaps, a 124px gauge row of
+// five cards, and two 36px button rows.
+static void layout(void) {
+    double m = 8, gap = 8, row_h = 36, card_h = 124;
+    double row2 = win_h - m - 7 - row_h, row1 = row2 - 6 - row_h;
+    k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
+    k_gpu->region.r = (Rect){m + 7, row2, win_w - 2 * (m + 7), row_h};
+    double gtop = row1 - gap - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
+    Gauge *order[] = {g_pwr, g_cpu, g_gpu, g_ram, g_tmp};
+    for (int i = 0; i < 5; i++) order[i]->region.r = (Rect){m + i * (card_w + gap) + 6, gtop + 6, card_w - 12, card_h - 12};
+    panel.region.r = (Rect){m + 6, m + 6, win_w - 2 * m - 12, gtop - gap - m - 12};
+    for (int i = 0; i < n_regions; i++) {
+        regions[i]->dirty = TRUE;
+        g_clear_pointer(&regions[i]->base, g_free);  // static layers are redrawn at the new geometry
+    }
+}
+
+// ---------------------------------------------------------------- wayland
+
+static struct wl_display *display;
+static struct wl_compositor *compositor;
+static struct wl_shm *shm;
+static struct xdg_wm_base *wm_base;
+static struct wl_seat *seat;
+static struct wl_surface *surface;
+static struct xdg_surface *xdg_surface;
+static struct xdg_toplevel *toplevel;
+static struct wl_touch *touch;
+static struct wl_pointer *pointer;
+static gboolean configured, surface_scale_events, opt_windowed, opt_stats;
+static int output_scale = 1, pending_w, pending_h;
+static GMainLoop *loop;
+
+typedef struct {
+    struct wl_buffer *buffer;
+    uint32_t *px;
+    size_t size;
+    gboolean busy;
+    IRect dirty;  // canvas area this buffer hasn't received yet
+} Buffer;
+static Buffer buffers[2];
+
+static void buffer_release(void *data, struct wl_buffer *b) {
+    (void)b;
+    ((Buffer *)data)->busy = FALSE;
+}
+static const struct wl_buffer_listener buffer_listener = {buffer_release};
+
+static void destroy_buffers(void) {
+    for (int i = 0; i < 2; i++) {
+        if (buffers[i].buffer) wl_buffer_destroy(buffers[i].buffer);
+        if (buffers[i].px) munmap(buffers[i].px, buffers[i].size);
+        buffers[i] = (Buffer){0};
+    }
+}
+
+static void create_buffers(void) {
+    destroy_buffers();
+    for (int i = 0; i < 2; i++) {
+        Buffer *b = &buffers[i];
+        b->size = (size_t)canvas.w * canvas.h * 4;
+        int fd = memfd_create("thor-hud", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, b->size) < 0) g_error("thor-hud: shm: %s", g_strerror(errno));
+        b->px = mmap(NULL, b->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, b->size);
+        b->buffer = wl_shm_pool_create_buffer(pool, 0, canvas.w, canvas.h, canvas.w * 4, WL_SHM_FORMAT_XRGB8888);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+        wl_buffer_add_listener(b->buffer, &buffer_listener, b);
+        b->dirty = (IRect){0, 0, canvas.w, canvas.h};
+    }
+}
+
+static void resize(void) {
+    int w = win_w * S, h = win_h * S;
+    if (canvas.w != w || canvas.h != h) {
+        g_free(canvas.px);
+        canvas.px = g_malloc0((size_t)w * h * 4);
+        canvas.w = w;
+        canvas.h = h;
+        create_buffers();
+    }
+    layout();
+}
+
+static IRect unite(IRect a, IRect b) {
+    if (a.x0 >= a.x1 || a.y0 >= a.y1) return b;
+    return (IRect){MIN(a.x0, b.x0), MIN(a.y0, b.y0), MAX(a.x1, b.x1), MAX(a.y1, b.y1)};
+}
+
+// Redraws dirty regions into the canvas and sends what changed.
+static void present(void) {
+    if (!configured || !canvas.px) return;
+    IRect damage[8];
+    int n = 0;
+    for (int i = 0; i < n_regions; i++) {
+        Region *r = regions[i];
+        if (!r->dirty) continue;
+        clip = intersect(to_device(r->r), (IRect){0, 0, canvas.w, canvas.h});
+        int rw = clip.x1 - clip.x0;
+        if (r->draw_static && r->base) {
+            for (int y = clip.y0; y < clip.y1; y++)
+                memcpy(canvas.px + y * canvas.w + clip.x0, r->base + (y - clip.y0) * rw, rw * 4);
+        } else {
+            clear(clip);
+            if (r->draw_static) {
+                r->draw_static(r);
+                r->base = g_malloc((size_t)rw * (clip.y1 - clip.y0) * 4);
+                for (int y = clip.y0; y < clip.y1; y++)
+                    memcpy(r->base + (y - clip.y0) * rw, canvas.px + y * canvas.w + clip.x0, rw * 4);
+            }
+        }
+        r->draw(r);
+        r->dirty = FALSE;
+        damage[n++] = clip;
+        for (int b = 0; b < 2; b++) buffers[b].dirty = unite(buffers[b].dirty, clip);
+    }
+    if (!n) return;
+    Buffer *b = !buffers[0].busy ? &buffers[0] : !buffers[1].busy ? &buffers[1] : NULL;
+    if (!b) return;  // both with the compositor; the dirty rects carry over to the next present
+    IRect d = intersect(b->dirty, (IRect){0, 0, canvas.w, canvas.h});
+    for (int y = d.y0; y < d.y1; y++)
+        memcpy(b->px + y * canvas.w + d.x0, canvas.px + y * canvas.w + d.x0, (d.x1 - d.x0) * 4);
+    b->dirty = (IRect){0};
+    wl_surface_attach(surface, b->buffer, 0, 0);
+    wl_surface_set_buffer_scale(surface, S);
+    for (int i = 0; i < n; i++)
+        wl_surface_damage_buffer(surface, damage[i].x0, damage[i].y0, damage[i].x1 - damage[i].x0,
+                                 damage[i].y1 - damage[i].y0);
+    wl_surface_commit(surface);
+    b->busy = TRUE;
+    wl_display_flush(display);
+}
+
+static void set_scale(int scale) {
+    if (scale < 1 || scale == S) return;
+    S = scale;
+    if (configured) {
+        resize();
+        // A full repaint at the new scale: the old buffer contents are stale.
+        memset(canvas.px, 0, (size_t)canvas.w * canvas.h * 4);
+        present();
+    }
+}
+
+static void surface_enter(void *d, struct wl_surface *s, struct wl_output *o) {
+    (void)d, (void)s, (void)o;
+    if (!surface_scale_events) set_scale(output_scale);
+}
+static void surface_leave(void *d, struct wl_surface *s, struct wl_output *o) { (void)d, (void)s, (void)o; }
+static void surface_preferred_scale(void *d, struct wl_surface *s, int32_t scale) {
+    (void)d, (void)s;
+    surface_scale_events = TRUE;
+    set_scale(scale);
+}
+static void surface_preferred_transform(void *d, struct wl_surface *s, uint32_t t) { (void)d, (void)s, (void)t; }
+static const struct wl_surface_listener surface_listener = {surface_enter, surface_leave, surface_preferred_scale,
+                                                            surface_preferred_transform};
+
+static void output_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph, int32_t sp,
+                            const char *make, const char *model, int32_t t) {
+    (void)d, (void)o, (void)x, (void)y, (void)pw, (void)ph, (void)sp, (void)make, (void)model, (void)t;
+}
+static void output_mode(void *d, struct wl_output *o, uint32_t f, int32_t w, int32_t h, int32_t r) {
+    (void)d, (void)o, (void)f, (void)w, (void)h, (void)r;
+}
+static void output_done(void *d, struct wl_output *o) { (void)d, (void)o; }
+static void output_scale_ev(void *d, struct wl_output *o, int32_t scale) {
+    (void)d, (void)o;
+    output_scale = MAX(output_scale, scale);
+}
+static void output_name(void *d, struct wl_output *o, const char *n) { (void)d, (void)o, (void)n; }
+static void output_description(void *d, struct wl_output *o, const char *n) { (void)d, (void)o, (void)n; }
+static const struct wl_output_listener output_listener = {output_geometry, output_mode, output_done,
+                                                          output_scale_ev, output_name, output_description};
+
+static void wm_ping(void *d, struct xdg_wm_base *wm, uint32_t serial) {
+    (void)d;
+    xdg_wm_base_pong(wm, serial);
+}
+static const struct xdg_wm_base_listener wm_listener = {wm_ping};
+
+static void xdg_surface_configure(void *d, struct xdg_surface *xs, uint32_t serial) {
+    (void)d;
+    xdg_surface_ack_configure(xs, serial);
+    int w = pending_w > 0 ? pending_w : 620, h = pending_h > 0 ? pending_h : 540;
+    gboolean first = !configured;
+    configured = TRUE;
+    if (first || w != win_w || h != win_h) {
+        win_w = w;
+        win_h = h;
+        resize();
+        memset(canvas.px, 0, (size_t)canvas.w * canvas.h * 4);
+    }
+    present();
+}
+static const struct xdg_surface_listener xdg_surface_listener = {xdg_surface_configure};
+
+static void toplevel_configure(void *d, struct xdg_toplevel *t, int32_t w, int32_t h, struct wl_array *states) {
+    (void)d, (void)t, (void)states;
+    pending_w = w;
+    pending_h = h;
+}
+static void toplevel_close(void *d, struct xdg_toplevel *t) {
+    (void)d, (void)t;
+    g_main_loop_quit(loop);
+}
+static void toplevel_bounds(void *d, struct xdg_toplevel *t, int32_t w, int32_t h) { (void)d, (void)t, (void)w, (void)h; }
+static void toplevel_caps(void *d, struct xdg_toplevel *t, struct wl_array *c) { (void)d, (void)t, (void)c; }
+static const struct xdg_toplevel_listener toplevel_listener = {toplevel_configure, toplevel_close, toplevel_bounds,
+                                                               toplevel_caps};
+
+// Input: a button acts on release, if the touch or click both started and
+// ended on it.
+static struct { double x, y; int seg, idx; } press = {.seg = -1};
+
+static Segmented *seg_at(double x, double y, int *idx) {
+    Segmented *segs[] = {k_profile, k_gpu};
+    for (int i = 0; i < 2; i++)
+        if ((*idx = seg_hit(segs[i], x, y)) >= 0) return segs[i];
+    return NULL;
+}
+
+static void press_begin(double x, double y) {
+    int idx;
+    Segmented *s = seg_at(x, y, &idx);
+    press.seg = s == k_profile ? 0 : s == k_gpu ? 1 : -1;
+    press.idx = idx;
+}
+
+static void press_end(double x, double y) {
+    int idx;
+    Segmented *s = seg_at(x, y, &idx);
+    int seg = s == k_profile ? 0 : s == k_gpu ? 1 : -1;
+    if (seg >= 0 && seg == press.seg && idx == press.idx && idx != s->selected) {
+        s->selected = idx;  // show it now; sync_knobs corrects it if the change doesn't stick
+        s->region.dirty = TRUE;
+        s->pick(s->values[idx]);
+        present();
+    }
+    press.seg = -1;
+}
+
+static void touch_down(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, struct wl_surface *s, int32_t id,
+                       wl_fixed_t x, wl_fixed_t y) {
+    (void)d, (void)t, (void)serial, (void)time, (void)s, (void)id;
+    press.x = wl_fixed_to_double(x);
+    press.y = wl_fixed_to_double(y);
+    press_begin(press.x, press.y);
+}
+static void touch_up(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, int32_t id) {
+    (void)d, (void)t, (void)serial, (void)time, (void)id;
+    press_end(press.x, press.y);
+}
+static void touch_motion(void *d, struct wl_touch *t, uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y) {
+    (void)d, (void)t, (void)time, (void)id;
+    press.x = wl_fixed_to_double(x);
+    press.y = wl_fixed_to_double(y);
+}
+static void touch_frame(void *d, struct wl_touch *t) { (void)d, (void)t; }
+static void touch_cancel(void *d, struct wl_touch *t) {
+    (void)d, (void)t;
+    press.seg = -1;
+}
+static void touch_shape(void *d, struct wl_touch *t, int32_t id, wl_fixed_t a, wl_fixed_t b) {
+    (void)d, (void)t, (void)id, (void)a, (void)b;
+}
+static void touch_orientation(void *d, struct wl_touch *t, int32_t id, wl_fixed_t o) { (void)d, (void)t, (void)id, (void)o; }
+static const struct wl_touch_listener touch_listener = {touch_down, touch_up, touch_motion, touch_frame,
+                                                        touch_cancel, touch_shape, touch_orientation};
+
+static void pointer_enter(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *s, wl_fixed_t x,
+                          wl_fixed_t y) {
+    (void)d, (void)p, (void)serial, (void)s;
+    press.x = wl_fixed_to_double(x);
+    press.y = wl_fixed_to_double(y);
+}
+static void pointer_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *s) {
+    (void)d, (void)p, (void)serial, (void)s;
+}
+static void pointer_motion(void *d, struct wl_pointer *p, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+    (void)d, (void)p, (void)time;
+    press.x = wl_fixed_to_double(x);
+    press.y = wl_fixed_to_double(y);
+}
+static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time, uint32_t button,
+                           uint32_t state) {
+    (void)d, (void)p, (void)serial, (void)time, (void)button;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) press_begin(press.x, press.y);
+    else press_end(press.x, press.y);
+}
+static void pointer_axis(void *d, struct wl_pointer *p, uint32_t time, uint32_t axis, wl_fixed_t v) {
+    (void)d, (void)p, (void)time, (void)axis, (void)v;
+}
+static void pointer_frame(void *d, struct wl_pointer *p) { (void)d, (void)p; }
+static void pointer_axis_source(void *d, struct wl_pointer *p, uint32_t s) { (void)d, (void)p, (void)s; }
+static void pointer_axis_stop(void *d, struct wl_pointer *p, uint32_t t, uint32_t a) { (void)d, (void)p, (void)t, (void)a; }
+static void pointer_axis_discrete(void *d, struct wl_pointer *p, uint32_t a, int32_t v) { (void)d, (void)p, (void)a, (void)v; }
+static void pointer_axis_value120(void *d, struct wl_pointer *p, uint32_t a, int32_t v) { (void)d, (void)p, (void)a, (void)v; }
+static void pointer_axis_direction(void *d, struct wl_pointer *p, uint32_t a, uint32_t v) {
+    (void)d, (void)p, (void)a, (void)v;
+}
+static void pointer_warp(void *d, struct wl_pointer *p, wl_fixed_t x, wl_fixed_t y) { (void)d, (void)p, (void)x, (void)y; }
+static const struct wl_pointer_listener pointer_listener = {
+    pointer_enter, pointer_leave, pointer_motion, pointer_button, pointer_axis, pointer_frame,
+    pointer_axis_source, pointer_axis_stop, pointer_axis_discrete, pointer_axis_value120, pointer_axis_direction,
+    pointer_warp};
+
+static void seat_capabilities(void *d, struct wl_seat *s, uint32_t caps) {
+    (void)d;
+    if ((caps & WL_SEAT_CAPABILITY_TOUCH) && !touch) {
+        touch = wl_seat_get_touch(s);
+        wl_touch_add_listener(touch, &touch_listener, NULL);
+    }
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && !pointer) {
+        pointer = wl_seat_get_pointer(s);
+        wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    }
+}
+static void seat_name(void *d, struct wl_seat *s, const char *n) { (void)d, (void)s, (void)n; }
+static const struct wl_seat_listener seat_listener = {seat_capabilities, seat_name};
+
+static void registry_global(void *d, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t version) {
+    (void)d;
+    if (!strcmp(iface, wl_compositor_interface.name)) {
+        compositor = wl_registry_bind(reg, name, &wl_compositor_interface, MIN(version, 6));
+    } else if (!strcmp(iface, wl_shm_interface.name)) {
+        shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+    } else if (!strcmp(iface, xdg_wm_base_interface.name)) {
+        wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, 1);
+        xdg_wm_base_add_listener(wm_base, &wm_listener, NULL);
+    } else if (!strcmp(iface, wl_seat_interface.name) && !seat) {
+        seat = wl_registry_bind(reg, name, &wl_seat_interface, MIN(version, 5));
+        wl_seat_add_listener(seat, &seat_listener, NULL);
+    } else if (!strcmp(iface, wl_output_interface.name)) {
+        struct wl_output *o = wl_registry_bind(reg, name, &wl_output_interface, MIN(version, 2));
+        wl_output_add_listener(o, &output_listener, NULL);
+    }
+}
+static void registry_remove(void *d, struct wl_registry *r, uint32_t name) { (void)d, (void)r, (void)name; }
+static const struct wl_registry_listener registry_listener = {registry_global, registry_remove};
+
+static gboolean wayland_ready(gint fd, GIOCondition cond, gpointer data) {
+    (void)fd, (void)data;
+    if ((cond & (G_IO_ERR | G_IO_HUP)) || wl_display_dispatch(display) < 0) {
+        g_main_loop_quit(loop);
+        return G_SOURCE_REMOVE;
+    }
+    wl_display_flush(display);
+    return G_SOURCE_CONTINUE;
+}
+
+// ---------------------------------------------------------------- app
 
 static gboolean tick(gpointer data) {
     (void)data;
@@ -861,8 +1501,11 @@ static gboolean tick(gpointer data) {
     g_mutex_unlock(&fps_state.lock);
     panel_push(fresh ? fps : NAN, focus);
 
+    struct timespec t0, t1, t2;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t0);
     Sample s;
     sample(&s);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t1);
     char buf[32], sub[64];
     if (!isnan(s.cpu)) {
         snprintf(buf, sizeof buf, "%.0f%%", s.cpu);
@@ -890,58 +1533,93 @@ static gboolean tick(gpointer data) {
     Color tc = heat_color(hot, &TEMP_SCALE);
     gauge_update(g_tmp, hot, buf, sub, &tc, hot >= TEMP_SCALE.at[2] ? &tc : NULL);
 
-    panel.battery = s.bat_pct;
+    char bsub[32];
     if (!isnan(s.bat_eta))
-        snprintf(panel.battery_sub, sizeof panel.battery_sub, "%dh%02d %s", (int)s.bat_eta,
-                 (int)(s.bat_eta * 60) % 60, charging ? "to full" : "left");
+        snprintf(bsub, sizeof bsub, "%dh%02d %s", (int)s.bat_eta, (int)(s.bat_eta * 60) % 60,
+                 charging ? "to full" : "left");
     else
-        g_strlcpy(panel.battery_sub, charging ? "charging" : "", sizeof panel.battery_sub);
+        g_strlcpy(bsub, charging ? "charging" : "", sizeof bsub);
+    if (s.bat_pct != panel.battery || strcmp(bsub, panel.battery_sub)) panel.region.dirty = TRUE;
+    panel.battery = s.bat_pct;
+    g_strlcpy(panel.battery_sub, bsub, sizeof panel.battery_sub);
 
     double ram = 100 * s.mem_used / s.mem_total;
     Color rc = heat_color(ram, &RAM_SCALE);
     snprintf(buf, sizeof buf, "%.0f%%", ram);
     snprintf(sub, sizeof sub, "%.1f of %.0fG", s.mem_used, s.mem_total);
     gauge_update(g_ram, ram, buf, sub, &rc, ram >= RAM_SCALE.at[2] ? &rc : NULL);
+    present();
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t2);
+    if (opt_stats) {  // --stats: average CPU per tick, every 30 ticks
+        static double sample_ms, draw_ms;
+        static int n;
+        sample_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        draw_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
+        if (++n == 30) {
+            g_printerr("per tick: sample %.2f ms, draw+present %.2f ms\n", sample_ms / n, draw_ms / n);
+            sample_ms = draw_ms = n = 0;
+        }
+    }
     return G_SOURCE_CONTINUE;
 }
 
-static GtkWidget *card(GtkWidget *child, gboolean vexpand) {
-    GtkWidget *frame = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_add_css_class(frame, "card");
-    gtk_widget_set_vexpand(frame, vexpand);
-    gtk_box_append(GTK_BOX(frame), child);
-    return frame;
+// Writes the canvas as an RGB PNG.
+static void write_png(const char *path) {
+    int w = canvas.w, h = canvas.h;
+    size_t raw_len = (size_t)(w * 3 + 1) * h;
+    uint8_t *raw = g_malloc(raw_len), *p = raw;
+    for (int y = 0; y < h; y++) {
+        *p++ = 0;  // no filter
+        for (int x = 0; x < w; x++) {
+            uint32_t c = canvas.px[y * w + x];
+            *p++ = c >> 16;
+            *p++ = c >> 8;
+            *p++ = c;
+        }
+    }
+    uLongf zlen = compressBound(raw_len);
+    uint8_t *z = g_malloc(zlen);
+    compress2(z, &zlen, raw, raw_len, 6);
+    FILE *f = fopen(path, "wb");
+    if (!f) { g_printerr("thor-hud: can't write %s\n", path); return; }
+    fwrite("\x89PNG\r\n\x1a\n", 1, 8, f);
+    uint8_t ihdr[13] = {w >> 24, w >> 16, w >> 8, w, h >> 24, h >> 16, h >> 8, h, 8, 2, 0, 0, 0};
+    struct { const char *type; const uint8_t *data; uint32_t len; } chunks[] = {
+        {"IHDR", ihdr, 13}, {"IDAT", z, (uint32_t)zlen}, {"IEND", NULL, 0}};
+    for (int i = 0; i < 3; i++) {
+        uint8_t len[4] = {chunks[i].len >> 24, chunks[i].len >> 16, chunks[i].len >> 8, chunks[i].len};
+        fwrite(len, 1, 4, f);
+        fwrite(chunks[i].type, 1, 4, f);
+        if (chunks[i].len) fwrite(chunks[i].data, 1, chunks[i].len, f);
+        uLong crc = crc32(crc32(0, (const Bytef *)chunks[i].type, 4), chunks[i].data, chunks[i].len);
+        uint8_t c[4] = {crc >> 24, crc >> 16, crc >> 8, crc};
+        fwrite(c, 1, 4, f);
+    }
+    fclose(f);
+    g_free(raw);
+    g_free(z);
 }
 
-static gboolean snapshot(gpointer win) {
-    int w = gtk_widget_get_width(win), h = gtk_widget_get_height(win);
-    GdkPaintable *paintable = gtk_widget_paintable_new(win);
-    GtkSnapshot *snap = gtk_snapshot_new();
-    gdk_paintable_snapshot(paintable, snap, w, h);
-    GskRenderNode *node = gtk_snapshot_free_to_node(snap);
-    g_object_unref(paintable);
-    if (!node) return G_SOURCE_CONTINUE;  // not drawn yet (e.g. not mapped); try again shortly
-    GdkTexture *tex = gsk_renderer_render_texture(gtk_native_get_renderer(GTK_NATIVE(win)), node, NULL);
-    gdk_texture_save_to_png(tex, opt_snapshot);
-    g_print("snapshot %dx%d\n", w, h);
-    g_object_unref(tex);
-    gsk_render_node_unref(node);
-    g_application_quit(G_APPLICATION(gtk_window_get_application(win)));
-    return G_SOURCE_REMOVE;
-}
+static char *opt_snapshot;
 
-static gboolean start_snapshot(gpointer win) {
-    g_timeout_add(500, snapshot, win);
-    return G_SOURCE_REMOVE;
-}
-
-static void activate(GtkApplication *app, gpointer data) {
+static gboolean snapshot(gpointer data) {
     (void)data;
-    GtkCssProvider *css = gtk_css_provider_new();
-    gtk_css_provider_load_from_string(css, CSS);
-    gtk_style_context_add_provider_for_display(gdk_display_get_default(), GTK_STYLE_PROVIDER(css),
-                                               GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-    g_object_set(gtk_settings_get_default(), "gtk-application-prefer-dark-theme", TRUE, NULL);
+    if (!configured) return G_SOURCE_CONTINUE;
+    write_png(opt_snapshot);
+    g_print("snapshot %dx%d\n", win_w, win_h);
+    g_main_loop_quit(loop);
+    return G_SOURCE_REMOVE;
+}
+
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--windowed")) opt_windowed = TRUE;
+        else if (!strcmp(argv[i], "--stats")) opt_stats = TRUE;
+        else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) opt_snapshot = argv[++i];
+    }
+    fonts_init();
+    sampler_init();
+    panel.max_hz = display_max_hz(120);
 
     GError *err = NULL;
     power = g_dbus_proxy_new_for_bus_sync(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, NULL, "org.armada.Power",
@@ -953,41 +1631,11 @@ static void activate(GtkApplication *app, gpointer data) {
         g_signal_connect_swapped(power, "g-properties-changed", G_CALLBACK(on_properties_changed), NULL);
     }
 
-    sampler_init();
-    panel.max_hz = display_max_hz(120);
-
-    GtkWidget *win = gtk_application_window_new(app);
-    gtk_window_set_title(GTK_WINDOW(win), "Thor HUD");
-    GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-    gtk_widget_add_css_class(root, "root");
-    gtk_widget_set_margin_top(root, 8);
-    gtk_widget_set_margin_bottom(root, 8);
-    gtk_widget_set_margin_start(root, 8);
-    gtk_widget_set_margin_end(root, 8);
-    gtk_window_set_child(GTK_WINDOW(win), root);
-
-    panel.area = canvas_new(panel_draw, NULL);
-    gtk_widget_set_size_request(panel.area, -1, 120);
-    gtk_box_append(GTK_BOX(root), card(panel.area, TRUE));
-
-    GtkWidget *gauges = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    gtk_box_set_homogeneous(GTK_BOX(gauges), TRUE);
     g_pwr = gauge_new("WATTS", NEUTRAL, 15, 0);
     g_cpu = gauge_new("CPU", CPU_C, 100, 0);
     g_gpu = gauge_new("GPU", GPU_C, 100, 0);
     g_ram = gauge_new("RAM", NEUTRAL, 100, 0);
     g_tmp = gauge_new("°C", heat_color(0, &TEMP_SCALE), 95, 45);
-    Gauge *order[] = {g_pwr, g_cpu, g_gpu, g_ram, g_tmp};
-    for (size_t i = 0; i < G_N_ELEMENTS(order); i++) {
-        gtk_widget_set_size_request(order[i]->area, -1, 112);
-        gtk_box_append(GTK_BOX(gauges), card(order[i]->area, FALSE));
-    }
-    gtk_box_append(GTK_BOX(root), gauges);
-
-    GtkWidget *knobs = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_add_css_class(knobs, "knobs");
-    gtk_box_append(GTK_BOX(root), knobs);
-
     char *fallback[] = {"Eco", "Balanced", "Performance"}, **profiles = fallback;
     GVariant *avail = power_get("AvailableProfiles");
     gsize n_profiles = 3;
@@ -998,27 +1646,39 @@ static void activate(GtkApplication *app, gpointer data) {
     if (avail) g_variant_unref(avail);
     char *gpu_values[] = {"auto", "max"}, *gpu_labels[] = {"Auto", "Max GPU"};
     k_gpu = seg_new(gpu_values, gpu_labels, 2, pick_gpu);
-    gtk_box_append(GTK_BOX(knobs), k_profile->box);
-    gtk_box_append(GTK_BOX(knobs), k_gpu->box);
+    panel.region = (Region){.draw_static = panel_draw_static, .draw = panel_draw, .dirty = TRUE};
+    Region *all[] = {&panel.region, &g_pwr->region, &g_cpu->region, &g_gpu->region,
+                     &g_ram->region, &g_tmp->region, &k_profile->region, &k_gpu->region};
+    n_regions = G_N_ELEMENTS(all);
+    memcpy(regions, all, sizeof all);
 
+    display = wl_display_connect(NULL);
+    if (!display) g_error("thor-hud: can't connect to Wayland display");
+    struct wl_registry *registry = wl_display_get_registry(display);
+    wl_registry_add_listener(registry, &registry_listener, NULL);
+    wl_display_roundtrip(display);
+    if (!compositor || !shm || !wm_base) g_error("thor-hud: compositor lacks wl_compositor/wl_shm/xdg_wm_base");
+    wl_display_roundtrip(display);  // output scales, seat capabilities
+    S = output_scale;
+
+    surface = wl_compositor_create_surface(compositor);
+    wl_surface_add_listener(surface, &surface_listener, NULL);
+    xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface);
+    xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, NULL);
+    toplevel = xdg_surface_get_toplevel(xdg_surface);
+    xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
+    xdg_toplevel_set_title(toplevel, "Thor HUD");
+    xdg_toplevel_set_app_id(toplevel, "dev.thor.Hud");
+    if (!opt_windowed) xdg_toplevel_set_fullscreen(toplevel, NULL);
+    wl_surface_commit(surface);
+    wl_display_flush(display);
+
+    loop = g_main_loop_new(NULL, FALSE);
+    g_unix_fd_add(wl_display_get_fd(display), G_IO_IN | G_IO_ERR | G_IO_HUP, wayland_ready, NULL);
     sync_knobs(NULL);
     tick(NULL);
     g_timeout_add_seconds(1, tick, NULL);  // everything refreshes at 1 Hz
-
-    if (opt_windowed) gtk_window_set_default_size(GTK_WINDOW(win), 620, 540);
-    else gtk_window_fullscreen(GTK_WINDOW(win));
-    gtk_window_present(GTK_WINDOW(win));
-    if (opt_snapshot) g_timeout_add(8000, start_snapshot, win);
-}
-
-int main(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--windowed")) opt_windowed = TRUE;
-        else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) opt_snapshot = argv[++i];
-    }
-    GtkApplication *app = gtk_application_new("dev.thor.Hud", G_APPLICATION_NON_UNIQUE);
-    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
-    int status = g_application_run(G_APPLICATION(app), 1, argv);
-    g_object_unref(app);
-    return status;
+    if (opt_snapshot) g_timeout_add(8500, snapshot, NULL);
+    g_main_loop_run(loop);
+    return 0;
 }

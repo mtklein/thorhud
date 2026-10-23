@@ -12,16 +12,22 @@ overlay.
   Eco → conservative, Balanced → schedutil, Performance → performance
 
 Colours are muted and equal in lightness; only temperature, battery draw and RAM (blue → amber → red)
-change colour with their value; the battery ring runs green (≥40%), yellow (≥15%), red (≥5%), then bright purple.
+change colour with their value; the battery ring is blue when full, then green (≥40%), yellow (≥15%), red (≥5%), and bright purple.
 
 ## Build
 
-Written in C against GTK 4. Armada's image has no compiler, so build in a
-Fedora toolbox (same Fedora release as Armada, so the binary runs on the host):
+A plain Wayland client in C: it rasterises its own pixels (distance-field arcs,
+lines and rounded boxes; FreeType glyphs cached once) into shared-memory
+buffers, sends only the regions that changed, and handles touch itself. GLib
+provides the event loop and D-Bus. It uses about 1.3% of one little core.
+
+Armada's image has no compiler, so build in a Fedora toolbox (same Fedora
+release as Armada, so the binary runs on the host):
 
 ```bash
 toolbox create --distro fedora --release 44
-toolbox run -c fedora-toolbox-44 sudo dnf install -y gcc make pkgconf-pkg-config gtk4-devel
+toolbox run -c fedora-toolbox-44 sudo dnf install -y gcc make pkgconf-pkg-config \
+    wayland-devel wayland-protocols-devel freetype-devel fontconfig-devel glib2-devel zlib-ng-compat-devel
 toolbox run -c fedora-toolbox-44 make
 ```
 
@@ -43,4 +49,5 @@ If you close it, "Thor HUD" in the bottom screen's app drawer brings it back.
 ## Testing
 
 `thor-hud --windowed` runs in a 620×540 window; `thor-hud --snapshot out.png`
-renders to a PNG after a few seconds and exits.
+writes its own pixels to a PNG after a few seconds and exits; `thor-hud --stats`
+prints the CPU time per tick spent sampling and drawing.

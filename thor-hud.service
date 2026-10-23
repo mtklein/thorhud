@@ -4,7 +4,7 @@ After=armada-bottom-screen.service
 BindsTo=armada-bottom-screen.service
 
 [Service]
-Environment=WAYLAND_DISPLAY=armada-plasma-bottom GDK_BACKEND=wayland
+Environment=WAYLAND_DISPLAY=armada-plasma-bottom
 UnsetEnvironment=DISPLAY
 ExecStartPre=/bin/sh -c 'for i in $(seq 60); do [ -S "$XDG_RUNTIME_DIR/armada-plasma-bottom" ] && exit 0; sleep 1; done; exit 1'
 ExecStart=%h/.local/bin/thor-hud
