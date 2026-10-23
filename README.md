@@ -14,22 +14,31 @@ overlay.
 Colours are muted and equal in lightness; only temperature, battery draw and RAM (blue → amber → red)
 change colour with their value; the battery ring runs green (≥40%), yellow (≥15%), red (≥5%), then bright purple.
 
-## Install
+## Build
 
-Copy the files to the Thor (user `armada`):
+Written in C against GTK 4. Armada's image has no compiler, so build in a
+Fedora toolbox (same Fedora release as Armada, so the binary runs on the host):
 
 ```bash
-scp thor-hud armada@thor.local:.local/bin/
-scp thor-hud.service armada@thor.local:.config/systemd/user/
-scp thor-hud.desktop armada@thor.local:.local/share/applications/
-ssh armada@thor.local 'systemctl --user daemon-reload && systemctl --user enable --now thor-hud.service'
+toolbox create --distro fedora --release 44
+toolbox run -c fedora-toolbox-44 sudo dnf install -y gcc make pkgconf-pkg-config gtk4-devel
+toolbox run -c fedora-toolbox-44 make
+```
+
+## Install
+
+On the Thor (user `armada`), from the repo:
+
+```bash
+cp thor-hud ~/.local/bin/
+cp thor-hud.service ~/.config/systemd/user/
+cp thor-hud.desktop ~/.local/share/applications/
+systemctl --user daemon-reload && systemctl --user enable --now thor-hud.service
 ```
 
 The service is tied to `armada-bottom-screen.service`, so it starts whenever the
-bottom screen's Plasma session does. If you close it, "Thor HUD" in the bottom
-screen's app drawer brings it back.
-
-Needs only what Armada ships: Python 3, PyGObject, GTK 4.
+bottom screen's Plasma session does, pinned to the little cores (0–2) at nice 10.
+If you close it, "Thor HUD" in the bottom screen's app drawer brings it back.
 
 ## Testing
 
