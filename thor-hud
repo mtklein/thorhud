@@ -501,13 +501,6 @@ window, .root { background: #000; color: #e5e8eb; font-family: "Noto Sans"; }
 .seg button:first-child { border-radius: 10px 0 0 10px; }
 .seg button:last-child { border-radius: 0 10px 10px 0; }
 .seg button:checked { background: #3a434d; color: #e5e8eb; }
-scale trough { background: #23272a; min-height: 6px; border-radius: 3px; }
-scale highlight { background: #6b7580; border-radius: 3px; }
-scale slider { background: #c4c9ce; min-width: 24px; min-height: 24px; border-radius: 12px;
-               border: none; outline: none; box-shadow: none; }
-scale:disabled slider { background: #4a5058; }
-scale:disabled highlight { background: transparent; }
-.value { font-weight: bold; font-size: 13px; color: #e5e8eb; }
 """
 
 
@@ -613,26 +606,14 @@ class Hud(Gtk.ApplicationWindow):
         profiles = self.power.get("AvailableProfiles", ["Eco", "Balanced", "Performance"])
         self.k_profile = Segmented([(p, p) for p in profiles],
                                    lambda v: self.power.set("Profile", GLib.Variant("s", v)), "profile")
-        self.k_gpu_mode = Segmented([("auto", "Auto"), ("manual", "Fixed")], self.pick_gpu_mode, "gpu")
-        self.k_gpu_clock = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL,
-                                                    0, max(1, len(self.gpu_freqs) - 1), 1)
-        self.k_gpu_clock.set_draw_value(False)
-        self.k_gpu_clock.set_hexpand(True)
-        self.k_gpu_clock.connect("value-changed", self.gpu_clock_moved)
-        self.k_gpu_label = Gtk.Label(css_classes=["value"], width_chars=8, xalign=1)
-        self.gpu_clock_timer = None
+        self.k_gpu = Segmented([("auto", "Auto"), ("max", "Max")], self.pick_gpu, "gpu")
         self.governor_timer = None
         self.syncing = False
 
         knobs.attach(Gtk.Label(label="PROFILE", xalign=0, css_classes=["caption"]), 0, 0, 1, 1)
         knobs.attach(self.k_profile, 1, 0, 2, 1)
         knobs.attach(Gtk.Label(label="GPU CLK", xalign=0, css_classes=["caption"]), 0, 1, 1, 1)
-        gpu_row = Gtk.Box(spacing=10)
-        self.k_gpu_mode.set_size_request(130, -1)
-        gpu_row.append(self.k_gpu_mode)
-        gpu_row.append(self.k_gpu_clock)
-        gpu_row.append(self.k_gpu_label)
-        knobs.attach(gpu_row, 1, 1, 2, 1)
+        knobs.attach(self.k_gpu, 1, 1, 2, 1)
 
         self.sync_knobs()
         self.tick()
@@ -649,14 +630,12 @@ class Hud(Gtk.ApplicationWindow):
         self.syncing = True
         self.k_profile.select(self.power.get("Profile"))
         self.enforce_governor()
-        level = self.power.get("GpuPerformanceLevel", "auto")
-        self.k_gpu_mode.select(level)
-        clock = self.power.get("ManualGpuClock", self.gpu_freqs[-1] if self.gpu_freqs else 0)
-        if self.gpu_freqs:
-            idx = min(range(len(self.gpu_freqs)), key=lambda i: abs(self.gpu_freqs[i] - clock))
-            self.k_gpu_clock.set_value(idx)
-        self.k_gpu_clock.set_sensitive(level == "manual")
-        self.k_gpu_label.set_label(f"{clock} MHz" if level == "manual" else "auto")
+        if self.power.get("GpuPerformanceLevel", "auto") == "auto":
+            self.k_gpu.select("auto")
+        elif self.power.get("ManualGpuClock") == self.power.get("ManualGpuClockMax"):
+            self.k_gpu.select("max")
+        else:
+            self.k_gpu.select(None)  # pinned to some other clock elsewhere
         self.syncing = False
         return False
 
@@ -674,22 +653,13 @@ class Hud(Gtk.ApplicationWindow):
             return False
         self.governor_timer = GLib.timeout_add(400, apply)
 
-    def pick_gpu_mode(self, mode):
-        self.power.set("GpuPerformanceLevel", GLib.Variant("s", mode))
-
-    def gpu_clock_moved(self, scale):
-        if self.syncing or not self.gpu_freqs:
-            return
-        mhz = self.gpu_freqs[int(round(scale.get_value()))]
-        self.k_gpu_label.set_label(f"{mhz} MHz")
-        if self.gpu_clock_timer:
-            GLib.source_remove(self.gpu_clock_timer)
-
-        def commit():
-            self.gpu_clock_timer = None
-            self.power.set("ManualGpuClock", GLib.Variant("u", mhz))
-            return False
-        self.gpu_clock_timer = GLib.timeout_add(250, commit)
+    def pick_gpu(self, mode):
+        # "Max" pins the GPU at its top clock via the manual performance level.
+        if mode == "max":
+            self.power.set("ManualGpuClock", GLib.Variant("u", self.power.get("ManualGpuClockMax", 0)))
+            self.power.set("GpuPerformanceLevel", GLib.Variant("s", "manual"))
+        else:
+            self.power.set("GpuPerformanceLevel", GLib.Variant("s", "auto"))
 
     # -- metrics
     def fast_tick(self):
