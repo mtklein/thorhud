@@ -374,7 +374,7 @@ class FpsPanel(Gtk.DrawingArea):
 
     def __init__(self):
         super().__init__(hexpand=True, vexpand=True)
-        self.history = collections.deque(maxlen=120)
+        self.history = collections.deque(maxlen=60)  # one minute at 1 Hz
         self.fps, self.focus = None, ""
         self.battery, self.battery_sub = None, ""
         self.max_hz = display_max_hz()
@@ -579,8 +579,7 @@ class Hud(Gtk.ApplicationWindow):
 
         self.sync_knobs()
         self.tick()
-        GLib.timeout_add(500, self.fast_tick)
-        GLib.timeout_add(1000, self.tick)
+        GLib.timeout_add(1000, self.tick)  # everything refreshes at 1 Hz
 
     def card(self, child, vexpand=False):
         frame = Gtk.Box(css_classes=["card"], vexpand=vexpand)
@@ -624,14 +623,11 @@ class Hud(Gtk.ApplicationWindow):
             self.power.set("GpuPerformanceLevel", GLib.Variant("s", "auto"))
 
     # -- metrics
-    def fast_tick(self):
+    def tick(self):
         r = self.sampler.fps
         # Hold a reading until about 1.5 reporting intervals have passed.
         fresh = r.fps is not None and time.monotonic() - r.stamp < max(3, 450 / max(r.fps, 1))
         self.fps.push(r.fps if fresh else None, r.focus)
-        return True
-
-    def tick(self):
         s = self.sampler.sample()
         if s["cpu"] is not None:
             self.g_cpu.update(s["cpu"], f"{s['cpu']:.0f}%")
