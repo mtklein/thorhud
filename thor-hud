@@ -381,12 +381,12 @@ class FpsPanel(Gtk.DrawingArea):
 
     def push(self, fps, focus):
         self.fps, self.focus = fps, focus
-        self.history.append(fps if fps is not None else 0.0)
+        self.history.append(fps)  # None where the readout is blank; the graph gaps there
         self.queue_draw()
 
     def draw(self, _area, cr, w, h):
         pad = 10
-        top = max(30, max(self.history, default=60) * 1.15)
+        top = max(30, max((v for v in self.history if v is not None), default=0) * 1.15)
         top = min(self.max_hz, 30 * math.ceil(top / 30))
         gx, gw = pad, w - 2 * pad
         big = min(h * 0.34, 44)
@@ -405,20 +405,33 @@ class FpsPanel(Gtk.DrawingArea):
             if ref % label_step == 0:
                 text(cr, self, str(ref), gx, y - 2, 10, DIM, Pango.Weight.NORMAL, "left", "bottom")
         pts = list(self.history)
-        if len(pts) > 1:
-            step = gw / (self.history.maxlen - 1)
-            x0 = gx + gw - step * (len(pts) - 1)
-            cr.move_to(x0, gy + gh)
-            for i, v in enumerate(pts):
-                cr.line_to(x0 + i * step, gy + gh - gh * min(v, top) / top)
-            cr.line_to(x0 + (len(pts) - 1) * step, gy + gh)
+        step = gw / (self.history.maxlen - 1)
+        x0 = gx + gw - step * (len(pts) - 1)
+        runs, run = [], []  # contiguous stretches with readings
+        for i, v in enumerate(pts):
+            if v is None:
+                if run:
+                    runs.append(run)
+                run = []
+            else:
+                run.append((x0 + i * step, gy + gh - gh * min(v, top) / top))
+        if run:
+            runs.append(run)
+        cr.new_path()
+        cr.set_line_width(1.5)
+        for run in runs:
+            if len(run) < 2:
+                continue
+            cr.move_to(run[0][0], gy + gh)
+            for x, y in run:
+                cr.line_to(x, y)
+            cr.line_to(run[-1][0], gy + gh)
             cr.close_path()
             rgb(cr, NEUTRAL, 0.08)
             cr.fill()
-            for i, v in enumerate(pts):
-                (cr.move_to if i == 0 else cr.line_to)(x0 + i * step, gy + gh - gh * min(v, top) / top)
+            for i, (x, y) in enumerate(run):
+                (cr.move_to if i == 0 else cr.line_to)(x, y)
             rgb(cr, NEUTRAL)
-            cr.set_line_width(1.5)
             cr.stroke()
         if self.fps is not None:  # blank when gamescope has nothing recent
             uw = text(cr, self, "FPS", w - pad, pad + big * 0.9, big * 0.36, DIM, align="right", anchor="bottom")
