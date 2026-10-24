@@ -1,3 +1,5 @@
 thor-hud
 xdg-shell-protocol.c
 xdg-shell-client-protocol.h
+thor-hud-aarch64/
+thor-hud-aarch64.tar.gz

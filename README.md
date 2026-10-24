@@ -19,6 +19,21 @@ overlay.
 Colours are muted and equal in lightness; only temperature, battery draw and RAM (blue → amber → red)
 change colour with their value; the battery ring is blue when full, then green (≥40%), yellow (≥15%), red (≥5%), and bright purple.
 
+## Install
+
+On the Thor (Armada OS, user `armada`), from a terminal or over SSH:
+
+```bash
+curl -L https://github.com/mtklein/thorhud/releases/latest/download/thor-hud-aarch64.tar.gz | tar xz
+./thor-hud-aarch64/install.sh
+```
+
+It installs into `~/.local` and `~/.config` (no root), enables the service and
+starts it. The service is tied to `armada-bottom-screen.service`, so it starts
+whenever the bottom screen's Plasma session does, pinned to the little cores
+(0–2) at nice 10. If you close it, "Thor HUD" in the bottom screen's app drawer
+brings it back.
+
 ## Build
 
 A plain Wayland client in C: it rasterises its own pixels (distance-field arcs,
@@ -36,20 +51,16 @@ toolbox run -c fedora-toolbox-44 sudo dnf install -y gcc make pkgconf-pkg-config
 toolbox run -c fedora-toolbox-44 make
 ```
 
-## Install
+## Install from source
 
-On the Thor (user `armada`), from the repo:
+On the Thor (user `armada`), from the repo after building:
 
 ```bash
-install -m755 thor-hud ~/.local/bin/thor-hud.new && mv -f ~/.local/bin/thor-hud.new ~/.local/bin/thor-hud
-cp thor-hud.service ~/.config/systemd/user/
-cp thor-hud.desktop ~/.local/share/applications/
-systemctl --user daemon-reload && systemctl --user enable --now thor-hud.service
+./install.sh
 ```
 
-The service is tied to `armada-bottom-screen.service`, so it starts whenever the
-bottom screen's Plasma session does, pinned to the little cores (0–2) at nice 10.
-If you close it, "Thor HUD" in the bottom screen's app drawer brings it back.
+`make dist` builds the release tarball (`thor-hud-aarch64.tar.gz`): a stripped
+binary plus `install.sh`, the service and launcher files.
 
 ## Testing
 
