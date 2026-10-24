@@ -2,6 +2,10 @@
 Description=Thor HUD performance dashboard on the bottom screen
 After=armada-bottom-screen.service
 BindsTo=armada-bottom-screen.service
+# When game mode restarts (e.g. after a Steam crash), Armada's bottom session can
+# bounce several times in a second, cancelling our start each time; don't let
+# the default start rate limit lock us out after that.
+StartLimitIntervalSec=0
 
 [Service]
 Environment=WAYLAND_DISPLAY=armada-plasma-bottom
