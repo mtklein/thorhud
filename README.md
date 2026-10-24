@@ -7,13 +7,16 @@ overlay.
 <img src="docs/screenshot.png" width="620" alt="thor-hud on the Thor's bottom screen: FPS, game title and battery across the top, a one-minute FPS graph, the profile buttons, and temperature, CPU, GPU, RAM and watts meters">
 
 - **Header:** FPS (from gamescope's stats pipe), the focused game's title, battery % and time left/to full
-- **Graph:** about a minute of FPS history on a fixed 0–120 scale (the display's top refresh rate), with reference lines at 30, 60 and 120
 - **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, RAM
 - **Profile:** Eco / Balanced / Performance via Armada's `org.armada.Power` D-Bus service — no root needed.
   Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):
   Eco → conservative, Balanced → schedutil, Performance → performance
-- **Brightness swipes:** drag up/down anywhere off the buttons — left half for the bottom screen, right half
-  for the top — through logind's `Session.SetBrightness`. Armada re-applies its own saved bottom brightness from
+- **Graphs:** tap any stat — the FPS readout, the battery corner, or a gauge — to graph it. FPS, CPU, GPU and
+  watts show the last 2 minutes, temperature and RAM 5, battery 2 hours; noisy stats are drawn as a short
+  moving average over a faint fill of the raw readings.
+- **Brightness swipes:** drag up/down anywhere — left half for the bottom screen, right half for the top. Any
+  touch that moves more than a few pixels is a swipe, even one starting on a button; only taps that stay put
+  press buttons or pick graphs. It goes through logind's `Session.SetBrightness`. Armada re-applies its own saved bottom brightness from
   `/etc/armada/bottom-screen-brightness` every 2 s, so bottom swipes only stick once that file is removed
   (`sudo mv /etc/armada/bottom-screen-brightness /etc/armada/bottom-screen-brightness.bak`); the HUD then keeps
   its own setting in `~/.local/state/thor-hud/bottom-brightness`.
@@ -68,4 +71,6 @@ binary plus `install.sh`, the service and launcher files.
 
 `thor-hud --windowed` runs in a 620×540 window; `thor-hud --snapshot out.png`
 writes its own pixels to a PNG after a few seconds and exits; `thor-hud --stats`
-prints the CPU time per tick spent sampling and drawing.
+prints the CPU time per tick spent sampling and drawing; `--show cpu` (or fps, temp,
+gpu, ram, watts, battery) picks the graph at startup; `--snapshot-delay 60` waits
+longer before the snapshot.

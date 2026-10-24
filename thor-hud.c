@@ -34,13 +34,11 @@
 #include "xdg-shell-client-protocol.h"
 
 #define MAX_FPS 240
-#define HISTORY 60  // one minute at 1 Hz
 #define GPU_RESCAN 10
 #define MAX_CPUS 32
 #define MAX_ZONES 64
 #define MAX_CLIENTS 256
 
-static const int reference_fps[] = {30, 60, 120};  // graph reference lines (plus the display's top rate)
 
 // Each profile carries its CPU governor; the HUD reasserts it whenever the
 // profile changes (from here or from Steam), since armada-powerd applies its own.
@@ -874,33 +872,89 @@ static void gauge_update(Gauge *g, double value, const char *display, const char
     g->region.dirty = TRUE;
 }
 
-// FPS readout, focused game, battery, and a scrolling FPS history graph.
+// History for each stat that can be shown in the graph. Each keeps its own
+// window and fixed scale; noisy ones are drawn as a moving average over a faint
+// fill of the raw readings.
+typedef enum { S_FPS, S_TEMP, S_CPU, S_GPU, S_RAM, S_POWER, S_BATTERY, N_SERIES } SeriesId;
+
+typedef struct {
+    const char *title;
+    int cap, every, smooth;  // samples kept, ticks per sample, moving-average width
+    double lo, hi;           // fixed scale
+    int refs[4], n_refs;     // reference lines
+    const char *ref_unit;
+    double *v;               // oldest first; NAN where there was no reading (the graph gaps there)
+    int count, ticks;
+} Series;
+
+static Series series[N_SERIES] = {
+    [S_FPS] = {"FPS", 120, 1, 1, 0, 120, {30, 60, 120}, 3, ""},
+    [S_TEMP] = {"°C", 300, 1, 3, 30, 100, {55, 77, 88}, 3, "°"},
+    [S_CPU] = {"CPU", 120, 1, 5, 0, 100, {25, 50, 75, 100}, 4, "%"},
+    [S_GPU] = {"GPU", 120, 1, 5, 0, 100, {25, 50, 75, 100}, 4, "%"},
+    [S_RAM] = {"RAM", 300, 1, 1, 0, 100, {25, 50, 75, 100}, 4, "%"},
+    [S_POWER] = {"Watts", 120, 1, 5, 0, 15, {5, 10, 15}, 3, "W"},
+    [S_BATTERY] = {"Battery", 120, 60, 1, 0, 100, {25, 50, 75, 100}, 4, "%"},
+};
+static SeriesId shown = S_FPS;
+
+// Records one tick's reading; returns whether a sample was stored.
+static gboolean series_push(Series *se, double value) {
+    if (!se->v) {
+        se->v = g_new(double, se->cap);
+        se->ticks = se->every - 1;  // take the first reading right away
+    }
+    if (++se->ticks < se->every) return FALSE;
+    se->ticks = 0;
+    if (se->count == se->cap) memmove(se->v, se->v + 1, sizeof(double) * (se->cap - 1));
+    else se->count++;
+    se->v[se->count - 1] = value;
+    return TRUE;
+}
+
+static double series_last(const Series *se) { return se->count ? se->v[se->count - 1] : NAN; }
+
+static Color series_color(SeriesId id) {
+    double last = series_last(&series[id]);
+    switch (id) {
+    case S_CPU: return CPU_C;
+    case S_GPU: return GPU_C;
+    case S_TEMP: return heat_color(isnan(last) ? 0 : last, &TEMP_SCALE);
+    case S_BATTERY: return isnan(last) ? NEUTRAL : battery_color((int)last);
+    default: return NEUTRAL;
+    }
+}
+
+// FPS readout, focused game, battery, and the graph of the selected stat.
 static struct {
     Region region;
-    double history[HISTORY];  // NAN where the readout is blank; the graph gaps there
-    int count;
     double fps;
     char focus[64];
     int battery;  // -1 when unknown
     char battery_sub[32];
-    int max_hz;
 } panel = {.fps = NAN, .battery = -1};
 
-static void panel_push(double fps, const char *focus) {
+static void panel_set_fps(double fps, const char *focus) {
     gboolean blank = isnan(fps) && isnan(panel.fps) && !strcmp(focus, panel.focus);
-    for (int i = 0; blank && i < panel.count; i++) blank = isnan(panel.history[i]);
+    Series *se = &series[S_FPS];
+    for (int i = 0; blank && i < se->count; i++) blank = isnan(se->v[i]);
     panel.fps = fps;
     g_strlcpy(panel.focus, focus, sizeof panel.focus);
-    if (panel.count == HISTORY) memmove(panel.history, panel.history + 1, sizeof(double) * (HISTORY - 1));
-    else panel.count++;
-    panel.history[panel.count - 1] = fps;
+    series_push(se, fps);
     if (!blank) panel.region.dirty = TRUE;  // an all-blank graph scrolling looks the same
 }
 
-typedef struct { double pad, top, gx, gw, big, gy, gh; } PanelGeometry;
+static void show_series(SeriesId id) {
+    if (id == shown) return;
+    shown = id;
+    g_clear_pointer(&panel.region.base, g_free);  // reference lines differ per stat
+    panel.region.dirty = TRUE;
+}
+
+typedef struct { double pad, gx, gw, big, gy, gh; } PanelGeometry;
 
 static PanelGeometry panel_geometry(Rect a) {
-    PanelGeometry k = {.pad = 10, .top = panel.max_hz};  // fixed scale: 0 to the display's top refresh rate
+    PanelGeometry k = {.pad = 10};
     k.gx = a.x + k.pad;
     k.gw = a.w - 2 * k.pad;
     k.big = MIN(a.h * 0.34, 44);
@@ -909,47 +963,59 @@ static PanelGeometry panel_geometry(Rect a) {
     return k;
 }
 
+static double series_y(const Series *se, PanelGeometry k, double v) {
+    return k.gy + k.gh - k.gh * (CLAMP(v, se->lo, se->hi) - se->lo) / (se->hi - se->lo);
+}
+
 static void panel_draw_static(Region *reg) {
     PanelGeometry k = panel_geometry(reg->r);
-    double top = k.top, gx = k.gx, gw = k.gw, gy = k.gy, gh = k.gh;
-    // Reference lines at the key frame rates, labelled on the left.
-    int refs[G_N_ELEMENTS(reference_fps) + 1], n_refs = 0;
-    for (size_t i = 0; i < G_N_ELEMENTS(reference_fps); i++)
-        if (reference_fps[i] < top) refs[n_refs++] = reference_fps[i];
-    refs[n_refs++] = (int)top;
-    for (int i = 0; i < n_refs; i++) {
-        double y = gy + gh - gh * refs[i] / top;
-        fill_rect((Rect){gx, y - 0.5, gw, 1}, TRACK, 0.7f);
+    const Series *se = &series[shown];
+    // Reference lines, labelled on the left; what's shown and over how long, on the right.
+    for (int i = 0; i < se->n_refs; i++) {
+        double y = series_y(se, k, se->refs[i]);
+        fill_rect((Rect){k.gx, y - 0.5, k.gw, 1}, TRACK, 0.7f);
         char label[16];
-        snprintf(label, sizeof label, "%d", refs[i]);
-        text(label, gx, y - 2, 10, DIM, 0, LEFT, BOTTOM, 0);
+        snprintf(label, sizeof label, "%d%s", se->refs[i], se->ref_unit);
+        text(label, k.gx, y - 2, 10, DIM, 0, LEFT, BOTTOM, 0);
     }
+    int secs = se->cap * se->every;
+    char caption[48];
+    if (secs >= 3600) snprintf(caption, sizeof caption, "%s · %d h", se->title, secs / 3600);
+    else snprintf(caption, sizeof caption, "%s · %d min", se->title, secs / 60);
+    text(caption, k.gx + k.gw, series_y(se, k, se->hi) - 2, 10, DIM, 0, RIGHT, BOTTOM, 0);
 }
 
 static void panel_draw(Region *reg) {
     Rect a = reg->r;
     PanelGeometry k = panel_geometry(a);
-    double pad = k.pad, top = k.top, gx = k.gx, gw = k.gw, big = k.big, gy = k.gy, gh = k.gh;
+    double pad = k.pad, big = k.big, gy = k.gy, gh = k.gh;
+    const Series *se = &series[shown];
+    Color c = series_color(shown);
 
-    // History: a faint fill under each contiguous stretch of readings, then its line.
-    double step = gw / (HISTORY - 1), x0 = gx + gw - step * (panel.count - 1);
-    uint32_t fill = pack(NEUTRAL);
-#define HY(i) (gy + gh - gh * MIN(panel.history[i], top) / top)
-    for (int i = 0; i + 1 < panel.count; i++) {
-        if (isnan(panel.history[i]) || isnan(panel.history[i + 1])) continue;
+    // A faint fill under each contiguous stretch of raw readings...
+    double step = k.gw / (se->cap - 1), x0 = k.gx + k.gw - step * (se->count - 1);
+    uint32_t fill = pack(c);
+    for (int i = 0; i + 1 < se->count; i++) {
+        if (isnan(se->v[i]) || isnan(se->v[i + 1])) continue;
         int xa = (int)lround((x0 + i * step) * S), xb = (int)lround((x0 + (i + 1) * step) * S);
-        double ya = HY(i) * S, yb = HY(i + 1) * S, bottom = (gy + gh) * S;
+        double ya = series_y(se, k, se->v[i]) * S, yb = series_y(se, k, se->v[i + 1]) * S, bottom = (gy + gh) * S;
         for (int x = MAX(xa, clip.x0); x < MIN(xb, clip.x1); x++) {
             double yt = ya + (yb - ya) * (x + 0.5 - xa) / MAX(1, xb - xa);
             for (int y = MAX(clip.y0, (int)floor(yt)); y < MIN(clip.y1, (int)lround(bottom)); y++)
                 blend(canvas.px + y * canvas.w + x, fill, 0.08f * (float)CLAMP(y + 1 - yt, 0.0, 1.0));
         }
     }
-    for (int i = 0; i + 1 < panel.count; i++) {
-        if (isnan(panel.history[i]) || isnan(panel.history[i + 1])) continue;
-        stroke_segment(x0 + i * step, HY(i), x0 + (i + 1) * step, HY(i + 1), 1.5, NEUTRAL, 1);
+    // ...and a line through their trailing moving average (restarting after each gap).
+    double prev = NAN, sum = 0;
+    int n = 0;
+    for (int i = 0; i < se->count; i++) {
+        if (isnan(se->v[i])) { prev = NAN; sum = 0; n = 0; continue; }
+        sum += se->v[i];
+        if (++n > se->smooth) sum -= se->v[i - se->smooth], n = se->smooth;
+        double y = series_y(se, k, sum / n);
+        if (!isnan(prev)) stroke_segment(x0 + (i - 1) * step, prev, x0 + i * step, y, 1.5, c, 1);
+        prev = y;
     }
-#undef HY
 
     if (!isnan(panel.fps)) {  // blank when gamescope has nothing recent
         char fps[16];
@@ -974,6 +1040,10 @@ static void panel_draw(Region *reg) {
         text(panel.battery_sub, cx - r - 8, mid, big * 0.3, DIM, 0, RIGHT, MIDDLE, 0);
     }
 }
+
+// Which stat, if any, a tap at (x, y) selects: the FPS readout and battery
+// corners of the header, or one of the gauges. They look the same as ever.
+static gboolean stat_at(double x, double y, SeriesId *id);
 
 // A row of toggle buttons; exactly one is selected (or none, if the state
 // came from elsewhere and matches no button).
@@ -1460,34 +1530,69 @@ static void toplevel_caps(void *d, struct xdg_toplevel *t, struct wl_array *c) {
 static const struct xdg_toplevel_listener toplevel_listener = {toplevel_configure, toplevel_close, toplevel_bounds,
                                                                toplevel_caps};
 
-// Input: a button acts on release, if the touch or click both started and
-// ended on it; a press anywhere else is a brightness swipe.
-static struct { double x, y; int idx; gboolean down; } press = {.idx = -1};
+// Input: anything that moves more than a few pixels is a brightness swipe,
+// wherever it starts, so nearly the whole screen is swipeable. A press that
+// stays put is a tap: it presses a profile button or picks the graphed stat.
+#define TAP_SLOP 10.0  // logical px
+
+static struct { double x, y, x0, y0; gboolean down, dragging; } press;
+
+static gboolean stat_at(double x, double y, SeriesId *id) {
+    Rect a = panel.region.r;
+    PanelGeometry k = panel_geometry(a);
+    if (y >= a.y && y < k.gy) {  // header row: FPS readout on the left third, battery on the right
+        if (x < a.x + a.w / 3) { *id = S_FPS; return TRUE; }
+        if (x >= a.x + a.w * 2 / 3) { *id = S_BATTERY; return TRUE; }
+    }
+    struct { Gauge *g; SeriesId id; } gauges[] = {
+        {g_tmp, S_TEMP}, {g_cpu, S_CPU}, {g_gpu, S_GPU}, {g_ram, S_RAM}, {g_pwr, S_POWER}};
+    for (size_t i = 0; i < G_N_ELEMENTS(gauges); i++) {
+        Rect r = gauges[i].g->region.r;
+        if (x >= r.x - 6 && x < r.x + r.w + 6 && y >= r.y - 6 && y < r.y + r.h + 6) {  // the whole card
+            *id = gauges[i].id;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
 
 static void press_begin(double x, double y) {
     press.down = TRUE;
-    press.idx = seg_hit(k_profile, x, y);
-    if (press.idx < 0) swipe_begin(x, y);
+    press.dragging = FALSE;
+    press.x0 = press.x = x;
+    press.y0 = press.y = y;
 }
 
 static void press_move(double x, double y) {
     press.x = x;
     press.y = y;
-    if (press.down) swipe_move(y, FALSE);
+    if (!press.down) return;
+    if (!press.dragging && hypot(x - press.x0, y - press.y0) > TAP_SLOP) {
+        press.dragging = TRUE;
+        swipe_begin(press.x0, press.y0);
+    }
+    if (press.dragging) swipe_move(y, FALSE);
 }
 
 static void press_end(double x, double y) {
+    if (!press.down) return;
+    press.down = FALSE;
+    if (press.dragging) {
+        swipe_move(y, TRUE);
+        return;
+    }
     Segmented *s = k_profile;
-    int idx = seg_hit(s, x, y);
-    if (press.idx >= 0 && idx == press.idx && idx != s->selected) {
+    int idx = seg_hit(s, press.x0, press.y0);
+    SeriesId id;
+    if (idx >= 0 && idx != s->selected) {
         s->selected = idx;  // show it now; sync_knobs corrects it if the change doesn't stick
         s->region.dirty = TRUE;
         s->pick(s->values[idx]);
-        present();
+    } else if (idx < 0 && stat_at(press.x0, press.y0, &id)) {
+        show_series(id);
     }
-    swipe_move(y, TRUE);
-    press.idx = -1;
-    press.down = FALSE;
+    (void)x;
+    present();
 }
 
 static void touch_down(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, struct wl_surface *s, int32_t id,
@@ -1508,7 +1613,6 @@ static void touch_motion(void *d, struct wl_touch *t, uint32_t time, int32_t id,
 static void touch_frame(void *d, struct wl_touch *t) { (void)d, (void)t; }
 static void touch_cancel(void *d, struct wl_touch *t) {
     (void)d, (void)t;
-    press.idx = -1;
     press.down = FALSE;
     swipe.active = FALSE;
 }
@@ -1610,7 +1714,7 @@ static gboolean tick(gpointer data) {
     char focus[64];
     g_strlcpy(focus, fps_state.focus, sizeof focus);
     g_mutex_unlock(&fps_state.lock);
-    panel_push(fresh ? fps : NAN, focus);
+    panel_set_fps(fresh ? fps : NAN, focus);
 
     struct timespec t0, t1, t2;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t0);
@@ -1659,6 +1763,15 @@ static gboolean tick(gpointer data) {
     snprintf(buf, sizeof buf, "%.0f%%", ram);
     snprintf(sub, sizeof sub, "%.1f of %.0fG", s.mem_used, s.mem_total);
     gauge_update(g_ram, ram, buf, sub, &rc, ram >= RAM_SCALE.at[2] ? &rc : NULL);
+
+    // The graph redraws whenever the stat it shows gets a new sample (FPS
+    // redraws itself above, skipping all-blank stretches).
+    double readings[N_SERIES] = {
+        [S_TEMP] = hot, [S_CPU] = s.cpu, [S_GPU] = s.gpu, [S_RAM] = ram,
+        [S_POWER] = charging ? s.usb_w : s.bat_w, [S_BATTERY] = s.bat_pct,
+    };
+    for (int id = S_FPS + 1; id < N_SERIES; id++)
+        if (series_push(&series[id], readings[id]) && (SeriesId)id == shown) panel.region.dirty = TRUE;
     present();
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t2);
     if (opt_stats) {  // --stats: average CPU per tick, every 30 ticks
@@ -1712,6 +1825,7 @@ static void write_png(const char *path) {
 }
 
 static char *opt_snapshot;
+static int opt_snapshot_delay = 8;  // seconds
 
 static gboolean snapshot(gpointer data) {
     (void)data;
@@ -1727,12 +1841,20 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--windowed")) opt_windowed = TRUE;
         else if (!strcmp(argv[i], "--stats")) opt_stats = TRUE;
         else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) opt_snapshot = argv[++i];
+        else if (!strcmp(argv[i], "--snapshot-delay") && i + 1 < argc) opt_snapshot_delay = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--show") && i + 1 < argc) {
+            const char *want = argv[++i];
+            for (int id = 0; id < N_SERIES; id++)
+                if (!g_ascii_strcasecmp(want, series[id].title) || (id == S_TEMP && !g_ascii_strcasecmp(want, "temp")))
+                    shown = (SeriesId)id;
+        }
     }
     fonts_init();
     sampler_init();
     backlight_init();
     restore_bottom_brightness();
-    panel.max_hz = display_max_hz(120);
+    series[S_FPS].hi = display_max_hz(120);  // fixed scale: 0 to the display's top refresh rate
+    series[S_FPS].refs[series[S_FPS].n_refs - 1] = (int)series[S_FPS].hi;
 
     GError *err = NULL;
     power = g_dbus_proxy_new_for_bus_sync(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, NULL, "org.armada.Power",
@@ -1789,7 +1911,7 @@ int main(int argc, char **argv) {
     sync_knobs(NULL);
     tick(NULL);
     g_timeout_add_seconds(1, tick, NULL);  // everything refreshes at 1 Hz
-    if (opt_snapshot) g_timeout_add(8500, snapshot, NULL);
+    if (opt_snapshot) g_timeout_add(opt_snapshot_delay * 1000 + 500, snapshot, NULL);
     g_main_loop_run(loop);
     return 0;
 }
