@@ -1047,13 +1047,6 @@ static char *power_get_str(const char *name) {
     return s;
 }
 
-static guint32 power_get_u32(const char *name, guint32 fallback) {
-    GVariant *v = power_get(name);
-    guint32 u = v ? g_variant_get_uint32(v) : fallback;
-    if (v) g_variant_unref(v);
-    return u;
-}
-
 static void power_set_done(GObject *src, GAsyncResult *res, gpointer name) {
     GError *err = NULL;
     GVariant *ret = g_dbus_proxy_call_finish(G_DBUS_PROXY(src), res, &err);
@@ -1071,7 +1064,7 @@ static void power_set(const char *name, GVariant *value) {
                       power_set_done, (gpointer)name);
 }
 
-static Segmented *k_profile, *k_gpu;
+static Segmented *k_profile;
 static guint governor_timer;
 static void present(void);
 
@@ -1103,14 +1096,10 @@ static void enforce_governor(void) {
 
 static gboolean sync_knobs(gpointer data) {
     (void)data;
-    char *profile = power_get_str("Profile"), *level = power_get_str("GpuPerformanceLevel");
+    char *profile = power_get_str("Profile");
     seg_select(k_profile, profile);
     enforce_governor();
-    if (!level || !strcmp(level, "auto")) seg_select(k_gpu, "auto");
-    else if (power_get_u32("ManualGpuClock", 0) == power_get_u32("ManualGpuClockMax", 1)) seg_select(k_gpu, "max");
-    else seg_select(k_gpu, NULL);  // pinned to some other clock elsewhere
     g_free(profile);
-    g_free(level);
     present();
     return G_SOURCE_REMOVE;
 }
@@ -1119,34 +1108,157 @@ static void on_properties_changed(void) { g_idle_add(sync_knobs, NULL); }
 
 static void pick_profile(const char *value) { power_set("Profile", g_variant_new_string(value)); }
 
-static void pick_gpu(const char *mode) {
-    // "Max" pins the GPU at its top clock via the manual performance level.
-    if (!strcmp(mode, "max")) {
-        power_set("ManualGpuClock", g_variant_new_uint32(power_get_u32("ManualGpuClockMax", 0)));
-        power_set("GpuPerformanceLevel", g_variant_new_string("manual"));
-    } else {
-        power_set("GpuPerformanceLevel", g_variant_new_string("auto"));
+// ---------------------------------------------------------------- brightness
+//
+// Swipe up/down anywhere off the buttons: the left half sets the bottom
+// screen's backlight, the right half the top's. logind's Session.SetBrightness
+// lets the seat's own user write backlights without root.
+//
+// armada-control re-applies its saved bottom brightness every 2 s from
+// /etc/armada/bottom-screen-brightness, so bottom swipes only stick once that
+// file is gone; we keep and restore our own bottom setting instead.
+
+typedef struct {
+    char name[64];
+    int max;
+} Backlight;
+
+static Backlight bl_bottom = {"ae94000.dsi.0", 0}, bl_top = {"ae96000.dsi.0", 0};
+static GDBusConnection *system_bus;
+static int win_w = 620, win_h = 540;  // logical window size
+
+static int backlight_read(const Backlight *b) {
+    char path[160];
+    snprintf(path, sizeof path, "/sys/class/backlight/%s/brightness", b->name);
+    return (int)read_ll(path, -1);
+}
+
+static void backlight_init(void) {
+    char *out = NULL;
+    if (g_spawn_command_line_sync("/usr/libexec/armada/device-env", &out, NULL, NULL, NULL) && out) {
+        char **lines = g_strsplit(out, "\n", -1);
+        for (char **l = lines; *l; l++) {
+            if (g_str_has_prefix(*l, "ARMADA_SECONDARY_BACKLIGHT=")) g_strlcpy(bl_bottom.name, *l + 27, sizeof bl_bottom.name);
+            if (g_str_has_prefix(*l, "ARMADA_PRIMARY_BACKLIGHT=")) g_strlcpy(bl_top.name, *l + 25, sizeof bl_top.name);
+        }
+        g_strfreev(lines);
+    }
+    g_free(out);
+    Backlight *bls[] = {&bl_bottom, &bl_top};
+    for (int i = 0; i < 2; i++) {
+        char path[160];
+        snprintf(path, sizeof path, "/sys/class/backlight/%s/max_brightness", bls[i]->name);
+        bls[i]->max = (int)read_ll(path, 0);
+    }
+    system_bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, NULL);
+}
+
+// Object path of our user's session on seat0 (it changes when the session restarts).
+static char *seat_session(void) {
+    if (!system_bus) return NULL;
+    GVariant *ret = g_dbus_connection_call_sync(system_bus, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                                "org.freedesktop.login1.Manager", "ListSessions", NULL,
+                                                G_VARIANT_TYPE("(a(susso))"), G_DBUS_CALL_FLAGS_NONE, 1000, NULL, NULL);
+    if (!ret) return NULL;
+    char *found = NULL;
+    GVariantIter *it;
+    const char *id, *user, *seat, *path;
+    guint32 uid;
+    g_variant_get(ret, "(a(susso))", &it);
+    while (!found && g_variant_iter_next(it, "(&su&s&s&o)", &id, &uid, &user, &seat, &path))
+        if (uid == getuid() && !strcmp(seat, "seat0")) found = g_strdup(path);
+    g_variant_iter_free(it);
+    g_variant_unref(ret);
+    return found;
+}
+
+static char *session_path;
+
+static void backlight_set(const Backlight *b, int value) {
+    if (!session_path) session_path = seat_session();
+    if (!session_path || b->max <= 0) return;
+    g_dbus_connection_call(system_bus, "org.freedesktop.login1", session_path, "org.freedesktop.login1.Session",
+                           "SetBrightness", g_variant_new("(ssu)", "backlight", b->name, (guint32)value), NULL,
+                           G_DBUS_CALL_FLAGS_NONE, 1000, NULL, NULL, NULL);
+}
+
+// Brightness moves on a squared scale, so the dim end gets finer steps.
+static double backlight_level(const Backlight *b, int value) { return b->max > 0 ? sqrt((double)value / b->max) : 0; }
+static int backlight_value(const Backlight *b, double level) {
+    return MAX(1, (int)lround(CLAMP(level, 0.0, 1.0) * CLAMP(level, 0.0, 1.0) * b->max));
+}
+
+static char *bottom_state_path(void) {
+    return g_build_filename(g_get_user_state_dir(), "thor-hud", "bottom-brightness", NULL);
+}
+
+static void save_bottom_brightness(int value) {
+    char *path = bottom_state_path(), *dir = g_path_get_dirname(path), text[16];
+    g_mkdir_with_parents(dir, 0700);
+    snprintf(text, sizeof text, "%d\n", value);
+    g_file_set_contents(path, text, -1, NULL);
+    g_free(dir);
+    g_free(path);
+}
+
+static void restore_bottom_brightness(void) {
+    char *path = bottom_state_path();
+    int value = (int)read_ll(path, -1);
+    if (value > 0 && value <= bl_bottom.max && value != backlight_read(&bl_bottom)) backlight_set(&bl_bottom, value);
+    g_free(path);
+}
+
+#define SWIPE_RANGE 300.0  // logical px of drag for the full brightness range
+
+static struct {
+    gboolean active;
+    Backlight *bl;
+    double y0, level0;
+    int value;
+    gint64 last_set;
+} swipe;
+
+static void swipe_begin(double x, double y) {
+    swipe.bl = x < win_w / 2.0 ? &bl_bottom : &bl_top;
+    int cur = backlight_read(swipe.bl);
+    swipe.active = swipe.bl->max > 0 && cur >= 0;
+    swipe.y0 = y;
+    swipe.level0 = backlight_level(swipe.bl, cur);
+    swipe.value = cur;
+    g_clear_pointer(&session_path, g_free);  // re-resolve once per gesture
+}
+
+static void swipe_move(double y, gboolean final) {
+    if (!swipe.active) return;
+    int value = backlight_value(swipe.bl, swipe.level0 + (swipe.y0 - y) / SWIPE_RANGE);
+    gint64 now = g_get_monotonic_time();
+    if (value != swipe.value && (final || now - swipe.last_set > 30000)) {  // ~30 updates/s at most
+        backlight_set(swipe.bl, value);
+        swipe.value = value;
+        swipe.last_set = now;
+    }
+    if (final) {
+        if (swipe.bl == &bl_bottom) save_bottom_brightness(swipe.value);
+        swipe.active = FALSE;
     }
 }
 
 // ---------------------------------------------------------------- layout
 
 static Gauge *g_pwr, *g_cpu, *g_gpu, *g_ram, *g_tmp;
-static Region *regions[8];
+static Region *regions[7];
 static int n_regions;
-static int win_w = 620, win_h = 540;  // logical
 
-// Same geometry the GTK version had: 8px margins and gaps, a 124px gauge row of
-// five cards, and two 36px button rows.
+// Top to bottom: the graph panel (taking the rest), a 36px button row, and a
+// 124px row of five gauge cards along the bottom; 8px margins and gaps.
 static void layout(void) {
     double m = 8, gap = 8, row_h = 36, card_h = 124;
-    double row2 = win_h - m - 7 - row_h, row1 = row2 - 6 - row_h;
-    k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
-    k_gpu->region.r = (Rect){m + 7, row2, win_w - 2 * (m + 7), row_h};
-    double gtop = row1 - gap - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
+    double gtop = win_h - m - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
     Gauge *order[] = {g_pwr, g_cpu, g_gpu, g_ram, g_tmp};
     for (int i = 0; i < 5; i++) order[i]->region.r = (Rect){m + i * (card_w + gap) + 6, gtop + 6, card_w - 12, card_h - 12};
-    panel.region.r = (Rect){m + 6, m + 6, win_w - 2 * m - 12, gtop - gap - m - 12};
+    double row1 = gtop - gap - row_h;
+    k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
+    panel.region.r = (Rect){m + 6, m + 6, win_w - 2 * m - 12, row1 - gap - m - 12};
     for (int i = 0; i < n_regions; i++) {
         regions[i]->dirty = TRUE;
         g_clear_pointer(&regions[i]->base, g_free);  // static layers are redrawn at the new geometry
@@ -1349,34 +1461,33 @@ static const struct xdg_toplevel_listener toplevel_listener = {toplevel_configur
                                                                toplevel_caps};
 
 // Input: a button acts on release, if the touch or click both started and
-// ended on it.
-static struct { double x, y; int seg, idx; } press = {.seg = -1};
-
-static Segmented *seg_at(double x, double y, int *idx) {
-    Segmented *segs[] = {k_profile, k_gpu};
-    for (int i = 0; i < 2; i++)
-        if ((*idx = seg_hit(segs[i], x, y)) >= 0) return segs[i];
-    return NULL;
-}
+// ended on it; a press anywhere else is a brightness swipe.
+static struct { double x, y; int idx; gboolean down; } press = {.idx = -1};
 
 static void press_begin(double x, double y) {
-    int idx;
-    Segmented *s = seg_at(x, y, &idx);
-    press.seg = s == k_profile ? 0 : s == k_gpu ? 1 : -1;
-    press.idx = idx;
+    press.down = TRUE;
+    press.idx = seg_hit(k_profile, x, y);
+    if (press.idx < 0) swipe_begin(x, y);
+}
+
+static void press_move(double x, double y) {
+    press.x = x;
+    press.y = y;
+    if (press.down) swipe_move(y, FALSE);
 }
 
 static void press_end(double x, double y) {
-    int idx;
-    Segmented *s = seg_at(x, y, &idx);
-    int seg = s == k_profile ? 0 : s == k_gpu ? 1 : -1;
-    if (seg >= 0 && seg == press.seg && idx == press.idx && idx != s->selected) {
+    Segmented *s = k_profile;
+    int idx = seg_hit(s, x, y);
+    if (press.idx >= 0 && idx == press.idx && idx != s->selected) {
         s->selected = idx;  // show it now; sync_knobs corrects it if the change doesn't stick
         s->region.dirty = TRUE;
         s->pick(s->values[idx]);
         present();
     }
-    press.seg = -1;
+    swipe_move(y, TRUE);
+    press.idx = -1;
+    press.down = FALSE;
 }
 
 static void touch_down(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, struct wl_surface *s, int32_t id,
@@ -1392,13 +1503,14 @@ static void touch_up(void *d, struct wl_touch *t, uint32_t serial, uint32_t time
 }
 static void touch_motion(void *d, struct wl_touch *t, uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y) {
     (void)d, (void)t, (void)time, (void)id;
-    press.x = wl_fixed_to_double(x);
-    press.y = wl_fixed_to_double(y);
+    press_move(wl_fixed_to_double(x), wl_fixed_to_double(y));
 }
 static void touch_frame(void *d, struct wl_touch *t) { (void)d, (void)t; }
 static void touch_cancel(void *d, struct wl_touch *t) {
     (void)d, (void)t;
-    press.seg = -1;
+    press.idx = -1;
+    press.down = FALSE;
+    swipe.active = FALSE;
 }
 static void touch_shape(void *d, struct wl_touch *t, int32_t id, wl_fixed_t a, wl_fixed_t b) {
     (void)d, (void)t, (void)id, (void)a, (void)b;
@@ -1418,8 +1530,7 @@ static void pointer_leave(void *d, struct wl_pointer *p, uint32_t serial, struct
 }
 static void pointer_motion(void *d, struct wl_pointer *p, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
     (void)d, (void)p, (void)time;
-    press.x = wl_fixed_to_double(x);
-    press.y = wl_fixed_to_double(y);
+    press_move(wl_fixed_to_double(x), wl_fixed_to_double(y));
 }
 static void pointer_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time, uint32_t button,
                            uint32_t state) {
@@ -1619,6 +1730,8 @@ int main(int argc, char **argv) {
     }
     fonts_init();
     sampler_init();
+    backlight_init();
+    restore_bottom_brightness();
     panel.max_hz = display_max_hz(120);
 
     GError *err = NULL;
@@ -1644,11 +1757,9 @@ int main(int argc, char **argv) {
     k_profile = seg_new(profiles, profiles, (int)n_profiles, pick_profile);
     g_free(from_bus);
     if (avail) g_variant_unref(avail);
-    char *gpu_values[] = {"auto", "max"}, *gpu_labels[] = {"Auto", "Max GPU"};
-    k_gpu = seg_new(gpu_values, gpu_labels, 2, pick_gpu);
     panel.region = (Region){.draw_static = panel_draw_static, .draw = panel_draw, .dirty = TRUE};
     Region *all[] = {&panel.region, &g_pwr->region, &g_cpu->region, &g_gpu->region,
-                     &g_ram->region, &g_tmp->region, &k_profile->region, &k_gpu->region};
+                     &g_ram->region, &g_tmp->region, &k_profile->region};
     n_regions = G_N_ELEMENTS(all);
     memcpy(regions, all, sizeof all);
 
