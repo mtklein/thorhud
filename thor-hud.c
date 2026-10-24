@@ -69,7 +69,7 @@ typedef struct { double r, g, b; } Color;
 #define NEUTRAL HEX(0x9facba)  // slate (fps, ram, battery)
 #define BORDER  HEX(0x262a2f)  // button outlines
 #define CHECKED HEX(0x262b31)  // selected button / selected stat
-#define CHECKED_TRACK HEX(0x101214)  // meter tracks on a selected stat: a groove, darker than the highlight
+#define CHECKED_TRACK HEX(0x000000)  // meter tracks on a selected stat: true black, cut into the highlight
 
 // Battery ring bands: at or above this %, this colour. Plain good/bad signals,
 // so these carry more colour than the category accents.
@@ -1345,16 +1345,16 @@ static Gauge *g_pwr, *g_cpu, *g_gpu, *g_ram, *g_tmp;
 static Region *regions[7];
 static int n_regions;
 
-// Top to bottom: the graph panel (taking the rest), a 36px button row, and a
-// 124px row of five gauge cards along the bottom; 8px margins and gaps.
+// Top to bottom: the graph panel (taking the rest), a 124px row of five gauge
+// cards, and a 36px row of profile buttons along the bottom; 8px margins and gaps.
 static void layout(void) {
     double m = 8, gap = 8, row_h = 36, card_h = 124;
-    double gtop = win_h - m - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
+    double row1 = win_h - m - 7 - row_h;
+    k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
+    double gtop = row1 - gap - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
     Gauge *order[] = {g_tmp, g_cpu, g_gpu, g_ram, g_pwr};
     for (int i = 0; i < 5; i++) order[i]->region.r = (Rect){m + i * (card_w + gap), gtop, card_w, card_h};
-    double row1 = gtop - gap - row_h;
-    k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
-    panel.region.r = (Rect){m + 6, m + 6, win_w - 2 * m - 12, row1 - gap - m - 12};
+    panel.region.r = (Rect){m + 6, m + 6, win_w - 2 * m - 12, gtop - gap - m - 12};
     for (int i = 0; i < n_regions; i++) {
         regions[i]->dirty = TRUE;
         g_clear_pointer(&regions[i]->base, g_free);  // static layers are redrawn at the new geometry
