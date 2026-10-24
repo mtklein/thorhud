@@ -4,6 +4,8 @@ A quiet performance dashboard for the bottom screen of the AYN Thor running
 [Armada OS](https://armadaos.dev/) — the Linux stand-in for the stock Android
 overlay.
 
+<img src="docs/screenshot.png" width="620" alt="thor-hud on the Thor's bottom screen: FPS, game title and battery across the top, a one-minute FPS graph, the profile buttons, and temperature, CPU, GPU, RAM and watts meters">
+
 - **Header:** FPS (from gamescope's stats pipe), the focused game's title, battery % and time left/to full
 - **Graph:** about a minute of FPS history on a fixed 0–120 scale (the display's top refresh rate), with reference lines at 30, 60 and 120
 - **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, RAM
