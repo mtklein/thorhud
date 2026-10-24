@@ -69,6 +69,7 @@ typedef struct { double r, g, b; } Color;
 #define NEUTRAL HEX(0x9facba)  // slate (fps, ram, battery)
 #define BORDER  HEX(0x262a2f)  // button outlines
 #define CHECKED HEX(0x262b31)  // selected button / selected stat
+#define CHECKED_TRACK HEX(0x101214)  // meter tracks on a selected stat: a groove, darker than the highlight
 
 // Battery ring bands: at or above this %, this colour. Plain good/bad signals,
 // so these carry more colour than the category accents.
@@ -815,6 +816,7 @@ typedef enum { S_FPS, S_TEMP, S_CPU, S_GPU, S_RAM, S_POWER, S_BATTERY, N_SERIES 
 static SeriesId shown = S_FPS;
 
 static const double SELECT_RADIUS[4] = {10, 10, 10, 10};  // like the profile buttons
+#define SELECT_MARGIN 8.0  // highlight padding around a selected stat's content (logical px)
 
 // 270° arc meter with a big centre value and a small caption.
 typedef struct {
@@ -838,8 +840,13 @@ static GaugeGeometry gauge_geometry(Rect card) {
 static void gauge_draw_static(Region *reg) {
     Gauge *g = reg->data;
     GaugeGeometry k = gauge_geometry(reg->r);
-    if (g->series == (int)shown) round_box(reg->r, SELECT_RADIUS, 0, CHECKED, 1);
-    stroke_arc(k.cx, k.cy, k.r - k.lw / 2, k.lw, k.start, k.start + k.sweep, TRACK, 1);
+    gboolean selected = g->series == (int)shown;
+    if (selected) {
+        // Frame the meter evenly: the arc's outer edge on three sides, the caption line at the bottom.
+        double m = SELECT_MARGIN;
+        round_box((Rect){k.cx - k.r - m, k.cy - k.r - m, 2 * (k.r + m), 1.91 * k.r + 2 * m}, SELECT_RADIUS, 0, CHECKED, 1);
+    }
+    stroke_arc(k.cx, k.cy, k.r - k.lw / 2, k.lw, k.start, k.start + k.sweep, selected ? CHECKED_TRACK : TRACK, 1);
     text(g->label, k.cx, k.cy + k.r * 0.42, k.r * 0.19, DIM, 1, CENTER, MIDDLE, 0);
 }
 
@@ -1027,28 +1034,29 @@ static void panel_draw(Region *reg) {
         prev = y;
     }
 
-    double mid = a.y + pad + big * 0.6;
-    Rect corner = {a.x, a.y, 0, mid + big * 0.58 + 6 - a.y};  // selection highlight: down to just below the battery ring
-    if (shown == S_FPS) {
-        corner.w = 2 * pad + (measure(1, (int)lround(big * S), "888", NULL) +
-                              measure(1, (int)lround(big * 0.36 * S), "FPS", NULL)) / S + 6;
-        round_box(corner, SELECT_RADIUS, 0, CHECKED, 1);
-    }
+    double mid = a.y + pad + big * 0.6, m = SELECT_MARGIN;
     char fps[16];  // 0 when gamescope has nothing recent (a static screen)
     snprintf(fps, sizeof fps, "%.0f", isnan(panel.fps) ? 0 : panel.fps);
+    if (shown == S_FPS) {
+        // Frame the digits and label evenly: from the digits' top to their baseline.
+        int px = (int)lround(big * S);
+        double asc = sized(1, px)->size->metrics.ascender / 64.0 / S, baseline = a.y + pad + asc;
+        double top = baseline - glyph(1, px, '0')->top / (double)S;
+        double w = (measure(1, px, fps, NULL) + measure(1, (int)lround(big * 0.36 * S), "FPS", NULL)) / S + 6;
+        round_box((Rect){a.x + pad - m, top - m, w + 2 * m, baseline - top + 2 * m}, SELECT_RADIUS, 0, CHECKED, 1);
+    }
     double nw = text(fps, a.x + pad, a.y + pad, big, TEXT, 1, LEFT, TOP, 0);
     text("FPS", a.x + pad + nw + 6, a.y + pad + big * 0.9, big * 0.36, DIM, 1, LEFT, BOTTOM, 0);
     if (*panel.focus) text(app_name(panel.focus), a.x + a.w / 2, mid, big * 0.36, TEXT, 0, CENTER, MIDDLE, a.w * 0.45);
     if (panel.battery >= 0) {
         // Small ring meter around the percentage, in the top right corner.
         double r = big * 0.58, cx = a.x + a.w - pad - r, lw = 3.5;
-        if (shown == S_BATTERY) {
+        if (shown == S_BATTERY) {  // frame the time-left text and the ring evenly
             double sub_w = measure(0, (int)lround(big * 0.3 * S), panel.battery_sub, NULL) / S;
-            corner.x = cx - r - 8 - sub_w - pad;
-            corner.w = a.x + a.w - corner.x;
-            round_box(corner, SELECT_RADIUS, 0, CHECKED, 1);
+            double x0 = cx - r - 8 - sub_w - m;
+            round_box((Rect){x0, mid - r - m, cx + r + m - x0, 2 * (r + m)}, SELECT_RADIUS, 0, CHECKED, 1);
         }
-        stroke_arc(cx, mid, r - lw / 2, lw, 0, 2 * G_PI, TRACK, 1);
+        stroke_arc(cx, mid, r - lw / 2, lw, 0, 2 * G_PI, shown == S_BATTERY ? CHECKED_TRACK : TRACK, 1);
         if (panel.battery > 0) {
             double start = -G_PI / 2;
             stroke_arc(cx, mid, r - lw / 2, lw, start, start + 2 * G_PI * MIN(panel.battery, 100) / 100,
