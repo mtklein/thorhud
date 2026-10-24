@@ -11,7 +11,8 @@ overlay.
 - **Profile:** Eco / Balanced / Performance via Armada's `org.armada.Power` D-Bus service — no root needed.
   Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):
   Eco → conservative, Balanced → schedutil, Performance → performance
-- **Graphs:** tap any stat — the FPS readout, the battery corner, or a gauge — to graph it. FPS, CPU, GPU and
+- **Graphs:** tap any stat — the FPS readout, the battery corner, or a gauge — to graph it; tap it again to
+  leave the middle empty. The choice is remembered across restarts. FPS, CPU, GPU and
   watts show the last 2 minutes, temperature and RAM 5, battery 2 hours; noisy stats are drawn as a short
   moving average over a faint fill of the raw readings, with a tick marking the midpoint of the time axis.
 - **Brightness swipes:** drag up/down anywhere — left half for the bottom screen, right half for the top. Any
@@ -72,5 +73,5 @@ binary plus `install.sh`, the service and launcher files.
 `thor-hud --windowed` runs in a 620×540 window; `thor-hud --snapshot out.png`
 writes its own pixels to a PNG after a few seconds and exits; `thor-hud --stats`
 prints the CPU time per tick spent sampling and drawing; `--show cpu` (or fps, temp,
-gpu, ram, watts, battery) picks the graph at startup; `--snapshot-delay 60` waits
+gpu, ram, watts, battery, none) picks the graph at startup without saving it; `--snapshot-delay 60` waits
 longer before the snapshot.

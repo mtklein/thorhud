@@ -811,8 +811,8 @@ typedef struct Region {
     uint32_t *base;  // saved static pixels, NULL until drawn at the current layout
 } Region;
 
-// The stats that can be graphed, and the one that is.
-typedef enum { S_FPS, S_TEMP, S_CPU, S_GPU, S_RAM, S_POWER, S_BATTERY, N_SERIES } SeriesId;
+// The stats that can be graphed, and the one that is (S_NONE: an empty middle, for serenity).
+typedef enum { S_NONE = -1, S_FPS, S_TEMP, S_CPU, S_GPU, S_RAM, S_POWER, S_BATTERY, N_SERIES } SeriesId;
 static SeriesId shown = S_FPS;
 
 static const double SELECT_RADIUS[4] = {10, 10, 10, 10};  // like the profile buttons
@@ -982,6 +982,7 @@ static double series_y(const Series *se, PanelGeometry k, double v) {
 
 static void panel_draw_static(Region *reg) {
     PanelGeometry k = panel_geometry(reg->r);
+    if (shown == S_NONE) return;
     const Series *se = &series[shown];
     // Reference lines, labelled on the left.
     for (int i = 0; i < se->n_refs; i++) {
@@ -1002,10 +1003,9 @@ static void panel_draw_static(Region *reg) {
     text(when, mx + 4, bottom - 1, 10, DIM, 0, LEFT, BOTTOM, 0);
 }
 
-static void panel_draw(Region *reg) {
-    Rect a = reg->r;
-    PanelGeometry k = panel_geometry(a);
-    double pad = k.pad, big = k.big, gy = k.gy, gh = k.gh;
+// The selected stat's history: a faint fill of raw readings under a line through their moving average.
+static void draw_graph(PanelGeometry k) {
+    double gy = k.gy, gh = k.gh;
     const Series *se = &series[shown];
     Color c = series_color(shown);
 
@@ -1033,6 +1033,13 @@ static void panel_draw(Region *reg) {
         if (!isnan(prev)) stroke_segment(x0 + (i - 1) * step, prev, x0 + i * step, y, 1.5, c, 1);
         prev = y;
     }
+}
+
+static void panel_draw(Region *reg) {
+    Rect a = reg->r;
+    PanelGeometry k = panel_geometry(a);
+    double pad = k.pad, big = k.big;
+    if (shown != S_NONE) draw_graph(k);
 
     double mid = a.y + pad + big * 0.6, m = SELECT_MARGIN;
     char fps[16];  // 0 when gamescope has nothing recent (a static screen)
@@ -1361,9 +1368,38 @@ static void layout(void) {
     }
 }
 
+static char *graph_state_path(void) { return g_build_filename(g_get_user_state_dir(), "thor-hud", "graph", NULL); }
+
+// Remembers which stat is graphed (or none) across restarts.
+static void save_shown(void) {
+    char *path = graph_state_path(), *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    g_file_set_contents(path, shown == S_NONE ? "none\n" : series[shown].title, -1, NULL);
+    g_free(dir);
+    g_free(path);
+}
+
+// Parses a stat name as used by --show and the saved state; FALSE if unknown.
+static gboolean parse_shown(const char *name, SeriesId *out) {
+    if (!g_ascii_strcasecmp(name, "none")) { *out = S_NONE; return TRUE; }
+    if (!g_ascii_strcasecmp(name, "temp")) { *out = S_TEMP; return TRUE; }
+    for (int id = 0; id < N_SERIES; id++)
+        if (!g_ascii_strcasecmp(name, series[id].title)) { *out = (SeriesId)id; return TRUE; }
+    return FALSE;
+}
+
+static void load_shown(void) {
+    char *path = graph_state_path(), *text = NULL;
+    SeriesId id;
+    if (g_file_get_contents(path, &text, NULL, NULL) && parse_shown(g_strstrip(text), &id)) shown = id;
+    g_free(text);
+    g_free(path);
+}
+
 static void show_series(SeriesId id) {
     if (id == shown) return;
     shown = id;
+    save_shown();
     // The graph's reference lines and the gauges' highlights live in their static layers.
     for (int i = 0; i < n_regions; i++) {
         g_clear_pointer(&regions[i]->base, g_free);
@@ -1625,7 +1661,7 @@ static void press_end(double x, double y) {
         s->region.dirty = TRUE;
         s->pick(s->values[idx]);
     } else if (idx < 0 && stat_at(press.x0, press.y0, &id)) {
-        show_series(id);
+        show_series(id == shown ? S_NONE : id);  // tapping the graphed stat again clears the graph
     }
     (void)x;
     present();
@@ -1860,7 +1896,7 @@ static void write_png(const char *path) {
     g_free(z);
 }
 
-static char *opt_snapshot;
+static char *opt_snapshot, *opt_show;
 static int opt_snapshot_delay = 8;  // seconds
 
 static gboolean snapshot(gpointer data) {
@@ -1878,13 +1914,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--stats")) opt_stats = TRUE;
         else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) opt_snapshot = argv[++i];
         else if (!strcmp(argv[i], "--snapshot-delay") && i + 1 < argc) opt_snapshot_delay = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--show") && i + 1 < argc) {
-            const char *want = argv[++i];
-            for (int id = 0; id < N_SERIES; id++)
-                if (!g_ascii_strcasecmp(want, series[id].title) || (id == S_TEMP && !g_ascii_strcasecmp(want, "temp")))
-                    shown = (SeriesId)id;
-        }
+        else if (!strcmp(argv[i], "--show") && i + 1 < argc) opt_show = argv[++i];
     }
+    load_shown();
+    SeriesId want;
+    if (opt_show && parse_shown(opt_show, &want)) shown = want;  // for testing; not saved
     fonts_init();
     sampler_init();
     backlight_init();
