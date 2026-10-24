@@ -954,14 +954,14 @@ static void panel_draw(Region *reg) {
     if (!isnan(panel.fps)) {  // blank when gamescope has nothing recent
         char fps[16];
         snprintf(fps, sizeof fps, "%.0f", panel.fps);
-        double uw = text("FPS", a.x + a.w - pad, a.y + pad + big * 0.9, big * 0.36, DIM, 1, RIGHT, BOTTOM, 0);
-        text(fps, a.x + a.w - pad - uw - 6, a.y + pad, big, TEXT, 1, RIGHT, TOP, 0);
+        double nw = text(fps, a.x + pad, a.y + pad, big, TEXT, 1, LEFT, TOP, 0);
+        text("FPS", a.x + pad + nw + 6, a.y + pad + big * 0.9, big * 0.36, DIM, 1, LEFT, BOTTOM, 0);
     }
     double mid = a.y + pad + big * 0.6;
     if (*panel.focus) text(app_name(panel.focus), a.x + a.w / 2, mid, big * 0.36, TEXT, 0, CENTER, MIDDLE, a.w * 0.45);
     if (panel.battery >= 0) {
-        // Small ring meter around the percentage.
-        double r = big * 0.58, cx = a.x + pad + r, lw = 3.5;
+        // Small ring meter around the percentage, in the top right corner.
+        double r = big * 0.58, cx = a.x + a.w - pad - r, lw = 3.5;
         stroke_arc(cx, mid, r - lw / 2, lw, 0, 2 * G_PI, TRACK, 1);
         if (panel.battery > 0) {
             double start = -G_PI / 2;
@@ -971,7 +971,7 @@ static void panel_draw(Region *reg) {
         char pct[16];
         snprintf(pct, sizeof pct, "%d%%", panel.battery);
         text(pct, cx, mid, big * 0.3, TEXT, 1, CENTER, MIDDLE, 0);
-        text(panel.battery_sub, a.x + pad + 2 * r + 8, mid, big * 0.3, DIM, 0, LEFT, MIDDLE, 0);
+        text(panel.battery_sub, cx - r - 8, mid, big * 0.3, DIM, 0, RIGHT, MIDDLE, 0);
     }
 }
 
@@ -1254,7 +1254,7 @@ static int n_regions;
 static void layout(void) {
     double m = 8, gap = 8, row_h = 36, card_h = 124;
     double gtop = win_h - m - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
-    Gauge *order[] = {g_pwr, g_cpu, g_gpu, g_ram, g_tmp};
+    Gauge *order[] = {g_tmp, g_cpu, g_gpu, g_ram, g_pwr};
     for (int i = 0; i < 5; i++) order[i]->region.r = (Rect){m + i * (card_w + gap) + 6, gtop + 6, card_w - 12, card_h - 12};
     double row1 = gtop - gap - row_h;
     k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
