@@ -4,26 +4,33 @@ A quiet performance dashboard for the bottom screen of the AYN Thor running
 [Armada OS](https://armadaos.dev/) — the Linux stand-in for the stock Android
 overlay.
 
-<img src="docs/screenshot.png" width="620" alt="thor-hud on the Thor's bottom screen: FPS, game title and battery across the top, a one-minute FPS graph, the profile buttons, and temperature, CPU, GPU, RAM and watts meters">
+<img src="docs/screenshot.png" width="620" alt="thor-hud on the Thor's bottom screen: FPS, game title and battery across the top; a two-minute graph of power draw; temperature, CPU, GPU, RAM and watts meters with the watts meter highlighted; and the Eco, Balanced and Performance buttons along the bottom">
 
-- **Header:** FPS (from gamescope's stats pipe), the focused game's title, battery % and time left/to full
-- **Meters:** CPU %, GPU % (DRM fdinfo) and clock, watts (USB in or battery draw), hottest CPU/GPU temperature + fan RPM, RAM
-- **Profile:** Eco / Balanced / Performance via Armada's `org.armada.Power` D-Bus service — no root needed.
-  Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from Steam):
-  Eco → conservative, Balanced → schedutil, Performance → performance
-- **Graphs:** tap any stat — the FPS readout, the battery corner, or a gauge — to graph it; tap it again to
-  leave the middle empty. The choice is remembered across restarts. FPS, CPU, GPU and
-  watts show the last 2 minutes, temperature and RAM 5, battery 2 hours; noisy stats are drawn as a short
-  moving average over a faint fill of the raw readings, with a tick marking the midpoint of the time axis.
-- **Brightness swipes:** drag up/down anywhere — left half for the bottom screen, right half for the top. Any
-  touch that moves more than a few pixels is a swipe, even one starting on a button; only taps that stay put
-  press buttons or pick graphs. It goes through logind's `Session.SetBrightness`. Armada re-applies its own saved bottom brightness from
-  `/etc/armada/bottom-screen-brightness` every 2 s, so bottom swipes only stick once that file is removed
-  (`sudo mv /etc/armada/bottom-screen-brightness /etc/armada/bottom-screen-brightness.bak`); the HUD then keeps
-  its own setting in `~/.local/state/thor-hud/bottom-brightness`.
+From top to bottom:
 
-Colours are muted and equal in lightness; only temperature, battery draw and RAM (blue → amber → red)
-change colour with their value; the battery ring is blue when full, then green (≥40%), yellow (≥15%), red (≥5%), and bright purple.
+- **Header:** FPS (from gamescope's stats pipe; 0 when the screen is static), the focused game's title, and a
+  battery ring with time left or time to full.
+- **Graph:** the history of whichever stat you tap — the FPS readout, the battery corner, or any meter. FPS,
+  CPU, GPU and watts show the last 2 minutes, temperature and RAM 5, battery 2 hours, with reference lines and
+  a tick at the midpoint of the time axis. Noisy stats are drawn as a short moving average over a faint fill
+  of the raw readings. The graphed stat gets a subtle highlight; tap it again for an empty, quiet middle. The
+  choice is remembered across restarts.
+- **Meters:** hottest CPU/GPU temperature with fan speed, CPU %, GPU % (from DRM fdinfo) with its clock, RAM,
+  and watts (battery draw, or USB input while charging).
+- **Profile:** Eco / Balanced / Performance through Armada's `org.armada.Power` D-Bus service — no root needed.
+  Each profile carries a CPU governor, which the HUD reasserts whenever the profile changes (including from
+  Steam): Eco → conservative, Balanced → schedutil, Performance → performance.
+
+**Brightness swipes:** drag up or down anywhere — the left half sets the bottom screen's brightness, the right
+half the top's. Any touch that moves more than a few pixels is a swipe, even one starting on a button; only
+taps that stay put press buttons or pick graphs. This goes through logind's `Session.SetBrightness`. Armada
+re-applies its own saved bottom-screen brightness every 2 s, so bottom swipes only stick once that setting is
+moved aside (`sudo mv /etc/armada/bottom-screen-brightness /etc/armada/bottom-screen-brightness.bak`); the HUD
+then keeps its own in `~/.local/state/thor-hud/bottom-brightness`.
+
+**Colours** are muted, equal in lightness and drawn on true black for the OLED panel. CPU, GPU and RAM share a
+teal / violet / blue family. Temperature, battery draw and RAM shift from blue through amber to red as they
+climb; the battery ring is blue when full, then green (≥40%), yellow (≥15%), red (≥5%) and bright purple.
 
 ## Install
 
@@ -45,7 +52,8 @@ brings it back.
 A plain Wayland client in C: it rasterises its own pixels (distance-field arcs,
 lines and rounded boxes; FreeType glyphs cached once) into shared-memory
 buffers, sends only the regions that changed, and handles touch itself. GLib
-provides the event loop and D-Bus. It uses about 1.3% of one little core.
+provides the event loop and D-Bus. It runs pinned to the little cores and uses
+around 1–2% of one of them.
 
 Armada's image has no compiler, so build in a Fedora toolbox (same Fedora
 release as Armada, so the binary runs on the host):
