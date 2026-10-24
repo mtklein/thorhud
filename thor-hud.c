@@ -67,6 +67,8 @@ typedef struct { double r, g, b; } Color;
 #define CPU_C   HEX(0x7db7b6)  // teal
 #define GPU_C   HEX(0xada4cd)  // violet
 #define NEUTRAL HEX(0x9facba)  // slate (fps, ram, battery)
+#define BORDER  HEX(0x262a2f)  // button outlines
+#define CHECKED HEX(0x262b31)  // selected button / selected stat
 
 // Battery ring bands: at or above this %, this colour. Plain good/bad signals,
 // so these carry more colour than the category accents.
@@ -738,9 +740,10 @@ static const Glyph *glyph(int bold, int px, gunichar ch) {
     return g;
 }
 
+// Width of s (up to end, or all of it when end is NULL) in device pixels.
 static float measure(int bold, int px, const char *s, const char *end) {
     float w = 0;
-    for (const char *p = s; p < end && *p; p = g_utf8_next_char(p)) w += glyph(bold, px, g_utf8_get_char(p))->advance;
+    for (const char *p = s; (!end || p < end) && *p; p = g_utf8_next_char(p)) w += glyph(bold, px, g_utf8_get_char(p))->advance;
     return w;
 }
 
@@ -807,6 +810,12 @@ typedef struct Region {
     uint32_t *base;  // saved static pixels, NULL until drawn at the current layout
 } Region;
 
+// The stats that can be graphed, and the one that is.
+typedef enum { S_FPS, S_TEMP, S_CPU, S_GPU, S_RAM, S_POWER, S_BATTERY, N_SERIES } SeriesId;
+static SeriesId shown = S_FPS;
+
+static const double SELECT_RADIUS[4] = {10, 10, 10, 10};  // like the profile buttons
+
 // 270° arc meter with a big centre value and a small caption.
 typedef struct {
     Region region;
@@ -814,11 +823,13 @@ typedef struct {
     Color color, arc_color, value_color;
     double minimum, maximum, value;  // value NAN when none
     char display[32], sub[64];
+    int series;  // the graph a tap on this gauge shows
 } Gauge;
 
 typedef struct { double r, cx, cy, lw, start, sweep; } GaugeGeometry;
 
-static GaugeGeometry gauge_geometry(Rect a) {
+static GaugeGeometry gauge_geometry(Rect card) {
+    Rect a = {card.x + 6, card.y + 6, card.w - 12, card.h - 12};
     double r = MIN(a.w, a.h * 1.02) / 2 - 6;
     return (GaugeGeometry){r, a.x + a.w / 2, a.y + a.h / 2 + r * 0.08, MAX(4.0, r * 0.13), 135 * G_PI / 180,
                            270 * G_PI / 180};
@@ -827,6 +838,7 @@ static GaugeGeometry gauge_geometry(Rect a) {
 static void gauge_draw_static(Region *reg) {
     Gauge *g = reg->data;
     GaugeGeometry k = gauge_geometry(reg->r);
+    if (g->series == (int)shown) round_box(reg->r, SELECT_RADIUS, 0, CHECKED, 1);
     stroke_arc(k.cx, k.cy, k.r - k.lw / 2, k.lw, k.start, k.start + k.sweep, TRACK, 1);
     text(g->label, k.cx, k.cy + k.r * 0.42, k.r * 0.19, DIM, 1, CENTER, MIDDLE, 0);
 }
@@ -878,7 +890,6 @@ static void gauge_update(Gauge *g, double value, const char *display, const char
 // History for each stat that can be shown in the graph. Each keeps its own
 // window and fixed scale; noisy ones are drawn as a moving average over a faint
 // fill of the raw readings.
-typedef enum { S_FPS, S_TEMP, S_CPU, S_GPU, S_RAM, S_POWER, S_BATTERY, N_SERIES } SeriesId;
 
 typedef struct {
     const char *title;
@@ -899,7 +910,6 @@ static Series series[N_SERIES] = {
     [S_POWER] = {"Watts", 120, 1, 5, 0, 20, {5, 10, 15, 20}, 4, "W"},
     [S_BATTERY] = {"Battery", 120, 60, 1, 0, 100, {25, 50, 75, 100}, 4, "%"},
 };
-static SeriesId shown = S_FPS;
 
 // Records one tick's reading; returns whether a sample was stored.
 static gboolean series_push(Series *se, double value) {
@@ -947,13 +957,6 @@ static void panel_set_fps(double fps, const char *focus) {
     if (!blank) panel.region.dirty = TRUE;  // an all-blank graph scrolling looks the same
 }
 
-static void show_series(SeriesId id) {
-    if (id == shown) return;
-    shown = id;
-    g_clear_pointer(&panel.region.base, g_free);  // reference lines differ per stat
-    panel.region.dirty = TRUE;
-}
-
 typedef struct { double pad, gx, gw, big, gy, gh; } PanelGeometry;
 
 static PanelGeometry panel_geometry(Rect a) {
@@ -961,7 +964,7 @@ static PanelGeometry panel_geometry(Rect a) {
     k.gx = a.x + k.pad;
     k.gw = a.w - 2 * k.pad;
     k.big = MIN(a.h * 0.34, 44);
-    k.gy = a.y + k.pad + k.big * 1.4 + 6;  // graph starts below the readout's line box
+    k.gy = a.y + k.pad + k.big * 1.4 + 16;  // graph starts below the header (and any highlight behind it)
     k.gh = a.y + a.h - k.gy - k.pad;
     return k;
 }
@@ -1024,17 +1027,27 @@ static void panel_draw(Region *reg) {
         prev = y;
     }
 
-    if (!isnan(panel.fps)) {  // blank when gamescope has nothing recent
-        char fps[16];
-        snprintf(fps, sizeof fps, "%.0f", panel.fps);
-        double nw = text(fps, a.x + pad, a.y + pad, big, TEXT, 1, LEFT, TOP, 0);
-        text("FPS", a.x + pad + nw + 6, a.y + pad + big * 0.9, big * 0.36, DIM, 1, LEFT, BOTTOM, 0);
-    }
     double mid = a.y + pad + big * 0.6;
+    Rect corner = {a.x, a.y, 0, mid + big * 0.58 + 6 - a.y};  // selection highlight: down to just below the battery ring
+    if (shown == S_FPS) {
+        corner.w = 2 * pad + (measure(1, (int)lround(big * S), "888", NULL) +
+                              measure(1, (int)lround(big * 0.36 * S), "FPS", NULL)) / S + 6;
+        round_box(corner, SELECT_RADIUS, 0, CHECKED, 1);
+    }
+    char fps[16];  // 0 when gamescope has nothing recent (a static screen)
+    snprintf(fps, sizeof fps, "%.0f", isnan(panel.fps) ? 0 : panel.fps);
+    double nw = text(fps, a.x + pad, a.y + pad, big, TEXT, 1, LEFT, TOP, 0);
+    text("FPS", a.x + pad + nw + 6, a.y + pad + big * 0.9, big * 0.36, DIM, 1, LEFT, BOTTOM, 0);
     if (*panel.focus) text(app_name(panel.focus), a.x + a.w / 2, mid, big * 0.36, TEXT, 0, CENTER, MIDDLE, a.w * 0.45);
     if (panel.battery >= 0) {
         // Small ring meter around the percentage, in the top right corner.
         double r = big * 0.58, cx = a.x + a.w - pad - r, lw = 3.5;
+        if (shown == S_BATTERY) {
+            double sub_w = measure(0, (int)lround(big * 0.3 * S), panel.battery_sub, NULL) / S;
+            corner.x = cx - r - 8 - sub_w - pad;
+            corner.w = a.x + a.w - corner.x;
+            round_box(corner, SELECT_RADIUS, 0, CHECKED, 1);
+        }
         stroke_arc(cx, mid, r - lw / 2, lw, 0, 2 * G_PI, TRACK, 1);
         if (panel.battery > 0) {
             double start = -G_PI / 2;
@@ -1061,8 +1074,6 @@ typedef struct {
     void (*pick)(const char *value);
 } Segmented;
 
-#define BORDER HEX(0x262a2f)
-#define CHECKED HEX(0x262b31)
 
 static void seg_draw(Region *reg) {
     Segmented *s = reg->data;
@@ -1332,13 +1343,23 @@ static void layout(void) {
     double m = 8, gap = 8, row_h = 36, card_h = 124;
     double gtop = win_h - m - card_h, card_w = (win_w - 2 * m - 4 * gap) / 5;
     Gauge *order[] = {g_tmp, g_cpu, g_gpu, g_ram, g_pwr};
-    for (int i = 0; i < 5; i++) order[i]->region.r = (Rect){m + i * (card_w + gap) + 6, gtop + 6, card_w - 12, card_h - 12};
+    for (int i = 0; i < 5; i++) order[i]->region.r = (Rect){m + i * (card_w + gap), gtop, card_w, card_h};
     double row1 = gtop - gap - row_h;
     k_profile->region.r = (Rect){m + 7, row1, win_w - 2 * (m + 7), row_h};
     panel.region.r = (Rect){m + 6, m + 6, win_w - 2 * m - 12, row1 - gap - m - 12};
     for (int i = 0; i < n_regions; i++) {
         regions[i]->dirty = TRUE;
         g_clear_pointer(&regions[i]->base, g_free);  // static layers are redrawn at the new geometry
+    }
+}
+
+static void show_series(SeriesId id) {
+    if (id == shown) return;
+    shown = id;
+    // The graph's reference lines and the gauges' highlights live in their static layers.
+    for (int i = 0; i < n_regions; i++) {
+        g_clear_pointer(&regions[i]->base, g_free);
+        regions[i]->dirty = TRUE;
     }
 }
 
@@ -1555,7 +1576,7 @@ static gboolean stat_at(double x, double y, SeriesId *id) {
         {g_tmp, S_TEMP}, {g_cpu, S_CPU}, {g_gpu, S_GPU}, {g_ram, S_RAM}, {g_pwr, S_POWER}};
     for (size_t i = 0; i < G_N_ELEMENTS(gauges); i++) {
         Rect r = gauges[i].g->region.r;
-        if (x >= r.x - 6 && x < r.x + r.w + 6 && y >= r.y - 6 && y < r.y + r.h + 6) {  // the whole card
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {  // the whole card
             *id = gauges[i].id;
             return TRUE;
         }
@@ -1878,6 +1899,7 @@ int main(int argc, char **argv) {
     g_gpu = gauge_new("GPU", GPU_C, 100, 0);
     g_ram = gauge_new("RAM", NEUTRAL, 100, 0);
     g_tmp = gauge_new("°C", heat_color(0, &TEMP_SCALE), 95, 45);
+    g_pwr->series = S_POWER, g_cpu->series = S_CPU, g_gpu->series = S_GPU, g_ram->series = S_RAM, g_tmp->series = S_TEMP;
     char *fallback[] = {"Eco", "Balanced", "Performance"}, **profiles = fallback;
     GVariant *avail = power_get("AvailableProfiles");
     gsize n_profiles = 3;
