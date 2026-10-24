@@ -13,7 +13,7 @@ overlay.
   Eco → conservative, Balanced → schedutil, Performance → performance
 - **Graphs:** tap any stat — the FPS readout, the battery corner, or a gauge — to graph it. FPS, CPU, GPU and
   watts show the last 2 minutes, temperature and RAM 5, battery 2 hours; noisy stats are drawn as a short
-  moving average over a faint fill of the raw readings.
+  moving average over a faint fill of the raw readings, with a tick marking the midpoint of the time axis.
 - **Brightness swipes:** drag up/down anywhere — left half for the bottom screen, right half for the top. Any
   touch that moves more than a few pixels is a swipe, even one starting on a button; only taps that stay put
   press buttons or pick graphs. It goes through logind's `Session.SetBrightness`. Armada re-applies its own saved bottom brightness from

@@ -61,7 +61,10 @@ typedef struct { double r, g, b; } Color;
 #define TRACK   HEX(0x23272a)
 #define DIM     HEX(0x82878c)
 #define TEXT    HEX(0xe5e8eb)
-#define CPU_C   HEX(0x8bafcf)  // blue
+// CPU, GPU and RAM read as a family: teal, violet and (RAM's nominal end of
+// the heat scale) blue, evenly spaced in hue at equal lightness, with teal
+// kept out of the heat progression.
+#define CPU_C   HEX(0x7db7b6)  // teal
 #define GPU_C   HEX(0xada4cd)  // violet
 #define NEUTRAL HEX(0x9facba)  // slate (fps, ram, battery)
 
@@ -889,11 +892,11 @@ typedef struct {
 
 static Series series[N_SERIES] = {
     [S_FPS] = {"FPS", 120, 1, 1, 0, 120, {30, 60, 120}, 3, ""},
-    [S_TEMP] = {"°C", 300, 1, 3, 30, 100, {55, 77, 88}, 3, "°"},
+    [S_TEMP] = {"°C", 300, 1, 3, 25, 100, {30, 50, 70, 90}, 4, "°"},
     [S_CPU] = {"CPU", 120, 1, 5, 0, 100, {25, 50, 75, 100}, 4, "%"},
     [S_GPU] = {"GPU", 120, 1, 5, 0, 100, {25, 50, 75, 100}, 4, "%"},
     [S_RAM] = {"RAM", 300, 1, 1, 0, 100, {25, 50, 75, 100}, 4, "%"},
-    [S_POWER] = {"Watts", 120, 1, 5, 0, 15, {5, 10, 15}, 3, "W"},
+    [S_POWER] = {"Watts", 120, 1, 5, 0, 20, {5, 10, 15, 20}, 4, "W"},
     [S_BATTERY] = {"Battery", 120, 60, 1, 0, 100, {25, 50, 75, 100}, 4, "%"},
 };
 static SeriesId shown = S_FPS;
@@ -970,7 +973,7 @@ static double series_y(const Series *se, PanelGeometry k, double v) {
 static void panel_draw_static(Region *reg) {
     PanelGeometry k = panel_geometry(reg->r);
     const Series *se = &series[shown];
-    // Reference lines, labelled on the left; what's shown and over how long, on the right.
+    // Reference lines, labelled on the left.
     for (int i = 0; i < se->n_refs; i++) {
         double y = series_y(se, k, se->refs[i]);
         fill_rect((Rect){k.gx, y - 0.5, k.gw, 1}, TRACK, 0.7f);
@@ -978,11 +981,15 @@ static void panel_draw_static(Region *reg) {
         snprintf(label, sizeof label, "%d%s", se->refs[i], se->ref_unit);
         text(label, k.gx, y - 2, 10, DIM, 0, LEFT, BOTTOM, 0);
     }
-    int secs = se->cap * se->every;
-    char caption[48];
-    if (secs >= 3600) snprintf(caption, sizeof caption, "%s · %d h", se->title, secs / 3600);
-    else snprintf(caption, sizeof caption, "%s · %d min", se->title, secs / 60);
-    text(caption, k.gx + k.gw, series_y(se, k, se->hi) - 2, 10, DIM, 0, RIGHT, BOTTOM, 0);
+    // A tick at the time-axis midpoint: the right edge is now, the left edge twice as long ago.
+    // (The window spans (cap - 1) sample intervals; place the tick at exactly half the nominal window.)
+    double half = se->cap * se->every / 2.0, span = (se->cap - 1) * se->every;
+    double mx = k.gx + k.gw - k.gw * half / span, bottom = k.gy + k.gh;
+    fill_rect((Rect){mx - 0.5, bottom - 6, 1, 6}, DIM, 1);
+    char when[24];
+    if (half >= 3600) snprintf(when, sizeof when, "%g h ago", round(half / 360) / 10);
+    else snprintf(when, sizeof when, "%g min ago", round(half / 6) / 10);
+    text(when, mx + 4, bottom - 1, 10, DIM, 0, LEFT, BOTTOM, 0);
 }
 
 static void panel_draw(Region *reg) {
@@ -1866,7 +1873,7 @@ int main(int argc, char **argv) {
         g_signal_connect_swapped(power, "g-properties-changed", G_CALLBACK(on_properties_changed), NULL);
     }
 
-    g_pwr = gauge_new("WATTS", NEUTRAL, 15, 0);
+    g_pwr = gauge_new("WATTS", NEUTRAL, 20, 0);
     g_cpu = gauge_new("CPU", CPU_C, 100, 0);
     g_gpu = gauge_new("GPU", GPU_C, 100, 0);
     g_ram = gauge_new("RAM", NEUTRAL, 100, 0);
