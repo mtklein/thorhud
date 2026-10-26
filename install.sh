@@ -21,3 +21,7 @@ if [ -e /etc/armada/bottom-screen-brightness ]; then
     echo "For bottom-screen brightness swipes to stick, move Armada's saved setting aside:"
     echo "  sudo mv /etc/armada/bottom-screen-brightness /etc/armada/bottom-screen-brightness.bak"
 fi
+if [ ! -e /etc/inputplumber/capability_maps.d/ayn_type2.yaml ]; then
+    echo "For the AYN button to turn the bottom screen off and on, route it to thor-hud:"
+    echo "  sudo $(pwd)/ayn-button.sh"
+fi

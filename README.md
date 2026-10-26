@@ -28,6 +28,12 @@ re-applies its own saved bottom-screen brightness every 2 s, so bottom swipes on
 moved aside (`sudo mv /etc/armada/bottom-screen-brightness /etc/armada/bottom-screen-brightness.bak`); the HUD
 then keeps its own in `~/.local/state/thor-hud/bottom-brightness`.
 
+**AYN button:** turns the bottom screen off and on. Off is true black on the OLED with the bottom touchscreen
+ignored; the HUD keeps sampling, so the graphs carry on. Out of the box InputPlumber maps the button to
+nothing useful, so route it to the HUD once with `sudo ./ayn-button.sh` (from the release folder or the repo).
+It installs an override of InputPlumber's AYN capability map in `/etc/inputplumber/capability_maps.d`;
+`sudo ./ayn-button.sh --remove` takes it out.
+
 **Colours** are muted, equal in lightness and drawn on true black for the OLED panel. CPU, GPU and RAM share a
 teal / violet / blue family. Temperature, battery draw and RAM shift from blue through amber to red as they
 climb; the battery ring is blue when full, then green (≥40%), yellow (≥15%), red (≥5%) and bright purple.

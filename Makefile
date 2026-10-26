@@ -19,7 +19,7 @@ dist: thor-hud
 	rm -rf $(DIST) $(DIST).tar.gz
 	mkdir $(DIST)
 	strip -o $(DIST)/thor-hud thor-hud
-	cp install.sh thor-hud.service thor-hud.desktop README.md LICENSE $(DIST)/
+	cp install.sh ayn-button.sh thor-hud.service thor-hud.desktop README.md LICENSE $(DIST)/
 	tar -czf $(DIST).tar.gz $(DIST)
 	rm -rf $(DIST)
 

@@ -2,7 +2,7 @@
 //
 // Metrics: gamescope stats pipe (FPS, focused app), /proc and sysfs (CPU, GPU, power,
 // thermals, RAM, fan). Knobs: org.armada.Power on the system bus (profile, CPU
-// governor, GPU clock).
+// governor, GPU clock), brightness swipes, and the AYN button to blank the screen.
 //
 // A plain Wayland client: it draws its own pixels into shared-memory buffers
 // (see "raster" and "text" below) and handles its own touch input, with GLib
@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <math.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1227,6 +1228,7 @@ typedef struct {
 } Backlight;
 
 static Backlight bl_bottom = {"ae94000.dsi.0", 0}, bl_top = {"ae96000.dsi.0", 0};
+static char bottom_touchscreen[64] = "bottom_touchscreen";  // input device name, for blanking
 static GDBusConnection *system_bus;
 static int win_w = 620, win_h = 540;  // logical window size
 
@@ -1243,6 +1245,8 @@ static void backlight_init(void) {
         for (char **l = lines; *l; l++) {
             if (g_str_has_prefix(*l, "ARMADA_SECONDARY_BACKLIGHT=")) g_strlcpy(bl_bottom.name, *l + 27, sizeof bl_bottom.name);
             if (g_str_has_prefix(*l, "ARMADA_PRIMARY_BACKLIGHT=")) g_strlcpy(bl_top.name, *l + 25, sizeof bl_top.name);
+            if (g_str_has_prefix(*l, "ARMADA_SECONDARY_TOUCHSCREEN="))
+                g_strlcpy(bottom_touchscreen, *l + 29, sizeof bottom_touchscreen);
         }
         g_strfreev(lines);
     }
@@ -1407,6 +1411,53 @@ static void show_series(SeriesId id) {
     }
 }
 
+// ---------------------------------------------------------------- blanking
+//
+// The AYN button turns the bottom screen off and on: the HUD goes true black
+// (all pixels off on the OLED) and the bottom touchscreen is inhibited, while
+// sampling carries on so the graphs have no gap. The button reaches us through
+// InputPlumber, remapped to its D-Bus device as ui_quick2 (see README).
+
+static gboolean blanked, blank_pending;  // blank_pending: the black frame hasn't been sent yet
+
+// Inhibited input devices deliver no events; wheel may write the switch.
+static void set_touch_inhibited(gboolean on) {
+    glob_t g;
+    if (glob("/sys/class/input/input*/name", 0, NULL, &g)) return;
+    for (size_t i = 0; i < g.gl_pathc; i++) {
+        char name[64];
+        if (read_file(g.gl_pathv[i], name, sizeof name) <= 0) continue;
+        name[strcspn(name, "\n")] = 0;
+        if (strcmp(name, bottom_touchscreen)) continue;
+        char *dir = g_path_get_dirname(g.gl_pathv[i]), *path = g_build_filename(dir, "inhibited", NULL);
+        FILE *f = fopen(path, "w");  // a sysfs attribute: write in place, not by rename
+        if (!f || fputs(on ? "1" : "0", f) < 0 || fclose(f)) g_printerr("thor-hud: can't write %s\n", path);
+        g_free(path);
+        g_free(dir);
+    }
+    globfree(&g);
+}
+
+static void set_blanked(gboolean on) {
+    if (on == blanked) return;
+    blanked = on;
+    set_touch_inhibited(on);
+    swipe.active = FALSE;  // a touch in progress is dropped (see press_end)
+    blank_pending = on;
+    if (!on)
+        for (int i = 0; i < n_regions; i++) regions[i]->dirty = TRUE;  // the canvas was cleared
+    present();
+}
+
+static void on_input_event(GDBusConnection *c, const char *sender, const char *path, const char *iface,
+                           const char *signal, GVariant *params, gpointer data) {
+    (void)c, (void)sender, (void)path, (void)iface, (void)signal, (void)data;
+    const char *action;
+    double value;
+    g_variant_get(params, "(&sd)", &action, &value);
+    if (!strcmp(action, "ui_quick2") && value > 0.5) set_blanked(!blanked);  // on press, not release
+}
+
 // ---------------------------------------------------------------- wayland
 
 static struct wl_display *display;
@@ -1485,7 +1536,14 @@ static void present(void) {
     if (!configured || !canvas.px) return;
     IRect damage[8];
     int n = 0;
-    for (int i = 0; i < n_regions; i++) {
+    if (blanked && blank_pending) {  // one all-black frame, then nothing until unblanked
+        clip = (IRect){0, 0, canvas.w, canvas.h};
+        clear(clip);
+        damage[n++] = clip;
+        for (int b = 0; b < 2; b++) buffers[b].dirty = clip;
+        blank_pending = FALSE;
+    }
+    for (int i = 0; i < n_regions && !blanked; i++) {
         Region *r = regions[i];
         if (!r->dirty) continue;
         clip = intersect(to_device(r->r), (IRect){0, 0, canvas.w, canvas.h});
@@ -1509,7 +1567,10 @@ static void present(void) {
     }
     if (!n) return;
     Buffer *b = !buffers[0].busy ? &buffers[0] : !buffers[1].busy ? &buffers[1] : NULL;
-    if (!b) return;  // both with the compositor; the dirty rects carry over to the next present
+    if (!b) {  // both with the compositor; the dirty rects carry over to the next present
+        if (blanked) blank_pending = TRUE;  // retry the black frame on the next tick
+        return;
+    }
     IRect d = intersect(b->dirty, (IRect){0, 0, canvas.w, canvas.h});
     for (int y = d.y0; y < d.y1; y++)
         memcpy(b->px + y * canvas.w + d.x0, canvas.px + y * canvas.w + d.x0, (d.x1 - d.x0) * 4);
@@ -1629,6 +1690,7 @@ static gboolean stat_at(double x, double y, SeriesId *id) {
 }
 
 static void press_begin(double x, double y) {
+    if (blanked) return;  // in case the touchscreen couldn't be inhibited
     press.down = TRUE;
     press.dragging = FALSE;
     press.x0 = press.x = x;
@@ -1649,6 +1711,7 @@ static void press_move(double x, double y) {
 static void press_end(double x, double y) {
     if (!press.down) return;
     press.down = FALSE;
+    if (blanked) return;  // the screen went off mid-touch
     if (press.dragging) {
         swipe_move(y, TRUE);
         return;
@@ -1908,6 +1971,12 @@ static gboolean snapshot(gpointer data) {
     return G_SOURCE_REMOVE;
 }
 
+static gboolean quit(gpointer data) {
+    (void)data;
+    g_main_loop_quit(loop);
+    return G_SOURCE_REMOVE;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--windowed")) opt_windowed = TRUE;
@@ -1923,6 +1992,11 @@ int main(int argc, char **argv) {
     sampler_init();
     backlight_init();
     restore_bottom_brightness();
+    set_touch_inhibited(FALSE);  // in case a previous run was killed while blanked
+    if (system_bus)
+        g_dbus_connection_signal_subscribe(system_bus, "org.shadowblip.InputPlumber", "org.shadowblip.Input.DBusDevice",
+                                           "InputEvent", NULL, NULL, G_DBUS_SIGNAL_FLAGS_NONE, on_input_event, NULL,
+                                           NULL);
     series[S_FPS].hi = display_max_hz(120);  // fixed scale: 0 to the display's top refresh rate
     series[S_FPS].refs[series[S_FPS].n_refs - 1] = (int)series[S_FPS].hi;
 
@@ -1983,6 +2057,9 @@ int main(int argc, char **argv) {
     tick(NULL);
     g_timeout_add_seconds(1, tick, NULL);  // everything refreshes at 1 Hz
     if (opt_snapshot) g_timeout_add(opt_snapshot_delay * 1000 + 500, snapshot, NULL);
+    g_unix_signal_add(SIGTERM, quit, NULL);
+    g_unix_signal_add(SIGINT, quit, NULL);
     g_main_loop_run(loop);
+    if (blanked) set_touch_inhibited(FALSE);  // don't leave the bottom touchscreen dead
     return 0;
 }
