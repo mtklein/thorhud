@@ -1,0 +1,23 @@
+#!/bin/sh
+# SSH to the Thor (Armada OS) with the default armada/armada login, no key setup.
+#
+#   tools/thor                 interactive shell
+#   tools/thor 'command ...'   run a command
+#   THOR_HOST=1.2.3.4 tools/thor ...    (default 192.168.4.47)
+#   THOR_PASSWORD=...          if the password isn't the default
+#
+# SSH on the Thor is normally off: turn it on in Armada Control first, and off
+# again afterwards. After a reinstall the host key changes and ssh refuses;
+# clear the old one with: ssh-keygen -R 192.168.4.47
+#
+# The password goes through SSH_ASKPASS (this same script answers), so it
+# works from non-interactive shells too.
+#
+# Remote gotcha: `pkill -f pattern` also matches the bash running your ssh
+# command (its command line contains the pattern); anchor it, e.g. "^/bin/sh /tmp/x".
+if [ "${THOR_ASKPASS:-}" = 1 ]; then echo "${THOR_PASSWORD:-armada}"; exit 0; fi
+self=$(realpath "$0")
+exec env THOR_ASKPASS=1 SSH_ASKPASS="$self" SSH_ASKPASS_REQUIRE=force \
+  ssh -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no \
+      -o PreferredAuthentications=password,keyboard-interactive -o ConnectTimeout=10 \
+      "armada@${THOR_HOST:-192.168.4.47}" "$@"

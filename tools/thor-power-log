@@ -1,0 +1,26 @@
+#!/bin/sh
+# Logs the Thor's power, clocks and thermals every 10 s, over SSH (nothing is
+# left on the device). Ctrl-C to stop.
+#
+#   tools/thor-power-log [minutes]     (default 10)
+#
+# Columns: battery watts (V x I; POWER_NOW is garbage on the Thor), battery %,
+# GPU MHz (680 = top speed), big-core MHz (cpu7), hottest CPU/GPU zone in C, fan rpm.
+# Doesn't read gamescope's FPS pipe: thor-hud reads it, and two readers would
+# split the lines between them.
+dir=$(dirname "$(realpath "$0")")
+"$dir/thor" "sh -s ${1:-10}" <<'REMOTE'
+B=/sys/class/power_supply/battery
+G=$(ls -d /sys/class/devfreq/*.gpu | head -1)
+echo "time     W   bat% gpuMHz cpu7MHz tempC fan"
+i=0
+while [ $i -lt $(( $1 * 6 )) ]; do
+  w=$(awk -v v=$(cat $B/voltage_now) -v c=$(cat $B/current_now) 'BEGIN{c=c<0?-c:c; printf "%.1f", v*c/1e12}')
+  t=0
+  for z in /sys/class/thermal/thermal_zone*; do
+    case $(cat $z/type) in cpu*|gpuss*) v=$(cat $z/temp); [ $v -gt $t ] && t=$v;; esac
+  done
+  echo "$(date +%T) $w $(cat $B/capacity) $(( $(cat $G/cur_freq)/1000000 )) $(( $(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_cur_freq)/1000 )) $((t/1000)) $(cat /sys/class/hwmon/*/fan1_input 2>/dev/null | head -1)"
+  i=$((i+1)); sleep 10
+done
+REMOTE
