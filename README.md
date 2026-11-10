@@ -38,6 +38,25 @@ It installs an override of InputPlumber's AYN capability map in `/etc/inputplumb
 teal / violet / blue family. Temperature, battery draw and RAM shift from blue through amber to red as they
 climb; the battery ring is blue when full, then green (≥40%), yellow (≥15%), red (≥5%) and bright purple.
 
+## Bottom screen stays black (Armada 20261109)
+
+Not the HUD: that release keeps the bottom screen off until Steam is started and unlocked, and sends the unlock
+(`GAMESCOPE_COMPANION_LOCKED` on the root window) to X display `:0`, assuming `:0` is the main gamescope. The
+bottom screen's own gamescope starts as soon as the main one opens its DRM lease socket, just before the main one
+starts its Xwayland servers, and now and then wins the race for `:0`; the unlock then goes to the wrong gamescope
+and the panel stays off for the whole session.
+
+To wake it now, find the main gamescope's display (the one whose `GAMESCOPE_PID` is the session's gamescope,
+usually `:1` when this happens) and unlock there:
+
+    DISPLAY=:1 xprop -root -f GAMESCOPE_COMPANION_LOCKED 32c -set GAMESCOPE_COMPANION_LOCKED 0
+
+To stop the race, make the bottom gamescope wait for `:0` to exist before it starts:
+
+    mkdir -p ~/.config/systemd/user/armada-bottom-gamescope.service.d
+    cp armada-fixes/bottom-gamescope-after-primary-xwayland.conf ~/.config/systemd/user/armada-bottom-gamescope.service.d/
+    systemctl --user daemon-reload
+
 ## Install
 
 On the Thor (Armada OS, user `armada`), from a terminal or over SSH:
